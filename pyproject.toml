@@ -1,0 +1,6 @@
+[project]
+name = "task-factory"
+version = "0.1.0"
+description = "Turn real speedup commits into Harbor tasks, verified on real phones and attacked by cheating agents."
+requires-python = ">=3.13,<3.14"
+dependencies = ["google-genai>=2.33.0", "cryptography<46"]

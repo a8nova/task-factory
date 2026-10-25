@@ -1,0 +1,43 @@
+schema_version = "1.4"
+# The agent's repo is copied into the separate verifier container at the same path.
+artifacts = ["/app"]
+
+[metadata]
+author_name = "Task Factory"
+difficulty = "hard"
+category = "inference-optimization"
+tags = ["opencl", "adreno", "android", "llm-inference", "fp16", "image2d-gemv", "kernel-fusion", "gpu-argmax"]
+source_repo = "https://github.com/a8nova/adreno-llms"
+source_commit = "e2076eeb9b20"
+base_commit = "f6e489b3326b94264dde6e78ea5c7a68c748a258"
+port = "smollm2-135m-instruct"
+device = "Motorola Razr 2020 (Snapdragon 765G, Adreno 620)"
+
+[agent]
+timeout_sec = 3600
+
+[environment]
+# The agent can reach the device gateway and nothing else, so it can't fetch the reference commit.
+network_mode = "allowlist"
+allowed_hosts = ["host.docker.internal"]
+build_timeout_sec = 900.0
+os = "linux"
+mcp_servers = []
+
+[environment.env]
+TF_GATEWAY = "${TF_GATEWAY:-http://host.docker.internal:8799}"
+TF_TASK = "smollm2-image2d-decode"
+
+[verifier]
+timeout_sec = 1800.0
+environment_mode = "separate"
+network_mode = "allowlist"
+allowed_hosts = ["host.docker.internal"]
+
+[verifier.env]
+TF_GATEWAY = "${TF_GATEWAY:-http://host.docker.internal:8799}"
+TF_TASK = "smollm2-image2d-decode"
+TF_VERIFIER_KEY = "${TF_VERIFIER_KEY}"
+TF_GATEWAY_HMAC = "${TF_GATEWAY_HMAC}"
+
+[solution.env]

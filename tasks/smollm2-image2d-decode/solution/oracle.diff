@@ -1,0 +1,1717 @@
+diff --git a/src/models/smollm2-135m-instruct/kernels/argmax.cl b/src/models/smollm2-135m-instruct/kernels/argmax.cl
+new file mode 100644
+index 0000000..6e79806
+--- /dev/null
++++ b/src/models/smollm2-135m-instruct/kernels/argmax.cl
+@@ -0,0 +1,149 @@
++// GPU argmax over a contiguous logits row.
++//
++// Single-WG cooperative reduce. Each of WG_SIZE threads strides through
++// the logits, tracking a running (best_val, best_idx); a __local tree
++// reduce produces the final argmax. One int32 written to out_idx[0].
++//
++// Used by Model::generate's greedy fast path (Lever 1). Eliminates the
++// 100 KB padded-vocab readback + host fp16→fp32 + host argmax — at
++// vocab=50288 that's ~5 ms/tok of host stall.
++
++#ifdef USE_FP16
++  #pragma OPENCL EXTENSION cl_khr_fp16 : enable
++  typedef half storage_t;
++  #define LOAD(p, i) vload_half((i), (p))
++#else
++  typedef float storage_t;
++  #define LOAD(p, i) ((p)[(i)])
++#endif
++
++#ifndef WG_SIZE
++#define WG_SIZE 64
++#endif
++
++#ifndef NUM_WG
++#define NUM_WG 32
++#endif
++
++// Pass 1: each WG scans an interleaved subset of [0, valid_n) and writes
++// per-WG (best_val, best_idx) into scratch buffers.
++//   gws = NUM_WG * WG_SIZE, lws = WG_SIZE
++//   scratch_v: float[NUM_WG], scratch_i: int[NUM_WG]
++__kernel __attribute__((reqd_work_group_size(WG_SIZE, 1, 1)))
++void argmax_partial(__global const storage_t* logits,
++                    __global float* scratch_v,
++                    __global int*   scratch_i,
++                    const int n,
++                    const int valid_n,
++                    const int row_off) {
++  __local float ls_v[WG_SIZE];
++  __local int   ls_i[WG_SIZE];
++
++  const int tid = get_local_id(0);
++  const int wg  = get_group_id(0);
++  const int total_threads = WG_SIZE * NUM_WG;
++  const int gid = wg * WG_SIZE + tid;
++  const int limit = (valid_n > 0 && valid_n < n) ? valid_n : n;
++
++  float best_v = -INFINITY;
++  int   best_i = 0;
++
++  for (int j = gid; j < limit; j += total_threads) {
++    float v = LOAD(logits, row_off + j);
++    if (v > best_v) { best_v = v; best_i = j; }
++  }
++
++  ls_v[tid] = best_v;
++  ls_i[tid] = best_i;
++  barrier(CLK_LOCAL_MEM_FENCE);
++
++  for (int s = WG_SIZE >> 1; s > 0; s >>= 1) {
++    if (tid < s) {
++      if (ls_v[tid + s] > ls_v[tid]) {
++        ls_v[tid] = ls_v[tid + s];
++        ls_i[tid] = ls_i[tid + s];
++      }
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++  }
++
++  if (tid == 0) {
++    scratch_v[wg] = ls_v[0];
++    scratch_i[wg] = ls_i[0];
++  }
++}
++
++// Pass 2: 1 WG of NUM_WG threads (or padded) reduces NUM_WG candidates,
++// writes the final argmax to BOTH out_idx[write_off] (history) AND
++// cur_token_buf[0] (next-iter input). Folds the copy step.
++__kernel __attribute__((reqd_work_group_size(NUM_WG, 1, 1)))
++void argmax_final(__global const float* scratch_v,
++                  __global const int*   scratch_i,
++                  __global int* out_idx,
++                  __global int* cur_token,
++                  const int write_off) {
++  __local float ls_v[NUM_WG];
++  __local int   ls_i[NUM_WG];
++  const int tid = get_local_id(0);
++
++  ls_v[tid] = scratch_v[tid];
++  ls_i[tid] = scratch_i[tid];
++  barrier(CLK_LOCAL_MEM_FENCE);
++
++  for (int s = NUM_WG >> 1; s > 0; s >>= 1) {
++    if (tid < s) {
++      if (ls_v[tid + s] > ls_v[tid]) {
++        ls_v[tid] = ls_v[tid + s];
++        ls_i[tid] = ls_i[tid + s];
++      }
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++  }
++
++  if (tid == 0) {
++    out_idx[write_off] = ls_i[0];
++    cur_token[0] = ls_i[0];
++  }
++}
++
++__kernel __attribute__((reqd_work_group_size(WG_SIZE, 1, 1)))
++void argmax_row(__global const storage_t* logits,
++                __global int* out_idx,
++                const int n,
++                const int valid_n,
++                const int row_off,
++                const int write_off) {
++  // n = padded vocab (length of one logits row).
++  // valid_n = real vocab; positions [valid_n, n) are pad and must be ignored.
++  // row_off = element offset into `logits` of the row we want
++  //           (= (seq_len - 1) * n). Saves a clCreateSubBuffer per decode.
++  __local float ls_v[WG_SIZE];
++  __local int   ls_i[WG_SIZE];
++
++  const int tid = get_local_id(0);
++  const int limit = (valid_n > 0 && valid_n < n) ? valid_n : n;
++
++  float best_v = -INFINITY;
++  int   best_i = 0;
++
++  for (int j = tid; j < limit; j += WG_SIZE) {
++    float v = LOAD(logits, row_off + j);
++    if (v > best_v) { best_v = v; best_i = j; }
++  }
++
++  ls_v[tid] = best_v;
++  ls_i[tid] = best_i;
++  barrier(CLK_LOCAL_MEM_FENCE);
++
++  for (int s = WG_SIZE >> 1; s > 0; s >>= 1) {
++    if (tid < s) {
++      if (ls_v[tid + s] > ls_v[tid]) {
++        ls_v[tid] = ls_v[tid + s];
++        ls_i[tid] = ls_i[tid + s];
++      }
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++  }
++
++  if (tid == 0) out_idx[write_off] = ls_i[0];
++}
+diff --git a/src/models/smollm2-135m-instruct/kernels/block_fused.cl b/src/models/smollm2-135m-instruct/kernels/block_fused.cl
+index c0f921d..11b21cd 100644
+--- a/src/models/smollm2-135m-instruct/kernels/block_fused.cl
++++ b/src/models/smollm2-135m-instruct/kernels/block_fused.cl
+@@ -375,6 +375,417 @@ void fused_gate_up_silu_m1(
+ //      RoPE rotation — all merge into thread 0's write or the K-loop)
+ // Reuse WG_SIZE defined above.
+ //
++// ──────────────────────────────────────────────────────────────────────
++// SmolLM2-specific image2d_t-backed GEMV (Adreno texture cache path).
++//
++// Adreno 6xx GPUs have a dedicated texture-fetch engine with higher
++// effective bandwidth than buffer reads (1.3-1.5× measured on Qwen
++// port). Wrapping fp16 weights as CL_RGBA / CL_HALF_FLOAT images
++// (4 fp16 per pixel) routes reads through that engine. K=576 is
++// SmolLM2's hidden_size and is shared by q/k/v/o/gate/up/lm_head.
++//
++// no4 = 4 outputs per WG. 4 fp32 accumulators per thread share a
++// single x-vector load — register-level parallelism that quarters the
++// WG count. Predicate: N % 4 == 0 (true for all SmolLM2 GEMV sites).
++//
++// K=576 = 144 vec4-pixels = 2*64 + 16 → 2 full waves + 16-thread tail.
++// Buffer-fallback variants (gemv_m1_k576_no4) preserve the same
++// dispatch pattern when the W can't be wrapped as an image (oversized
++// row count beyond CL_DEVICE_IMAGE2D_MAX_HEIGHT, or driver refusal).
++#ifdef USE_FP16
++
++__constant sampler_t kImgSampler =
++    CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_NONE | CLK_FILTER_NEAREST;
++
++// K=576, image2d-backed W, 4 outputs per WG. N % 4 must be 0.
++// Dispatch: gws = (N / 4) * WG_SIZE, lws = WG_SIZE.
++__kernel
++__attribute__((reqd_work_group_size(WG_SIZE, 1, 1)))
++void gemv_m1_k576_no4_img(
++    __global const half* x,
++    __read_only image2d_t W_img,
++    __global half* out,
++    const int N) {
++  const int n_base = (int)get_group_id(0) * 4;
++  const int tid   = (int)get_local_id(0);
++  if (n_base >= N) return;
++
++  __local float partial[4][WG_SIZE];
++  float acc0=0.0f, acc1=0.0f, acc2=0.0f, acc3=0.0f;
++
++  // 2 full waves of vec4 (covers 2*256 = 512 fp16 of K=576).
++  #pragma unroll
++  for (int j = 0; j < 2; ++j) {
++    const int x_off = j * (WG_SIZE * 4) + tid * 4;
++    const int pix   = j *  WG_SIZE      + tid;       // pixel column (0..143)
++    float4 xv = vload_half4(0, x + x_off);
++    float4 w0 = convert_float4(read_imageh(W_img, kImgSampler, (int2)(pix, n_base + 0)));
++    float4 w1 = convert_float4(read_imageh(W_img, kImgSampler, (int2)(pix, n_base + 1)));
++    float4 w2 = convert_float4(read_imageh(W_img, kImgSampler, (int2)(pix, n_base + 2)));
++    float4 w3 = convert_float4(read_imageh(W_img, kImgSampler, (int2)(pix, n_base + 3)));
++    acc0 += dot(xv, w0); acc1 += dot(xv, w1);
++    acc2 += dot(xv, w2); acc3 += dot(xv, w3);
++  }
++  // Tail: 576-512 = 64 fp16 = 16 vec4 → first 16 threads.
++  if (tid < 16) {
++    const int x_off = 2 * (WG_SIZE * 4) + tid * 4;
++    const int pix   = 2 *  WG_SIZE      + tid;       // pix in [128..143]
++    float4 xv = vload_half4(0, x + x_off);
++    float4 w0 = convert_float4(read_imageh(W_img, kImgSampler, (int2)(pix, n_base + 0)));
++    float4 w1 = convert_float4(read_imageh(W_img, kImgSampler, (int2)(pix, n_base + 1)));
++    float4 w2 = convert_float4(read_imageh(W_img, kImgSampler, (int2)(pix, n_base + 2)));
++    float4 w3 = convert_float4(read_imageh(W_img, kImgSampler, (int2)(pix, n_base + 3)));
++    acc0 += dot(xv, w0); acc1 += dot(xv, w1);
++    acc2 += dot(xv, w2); acc3 += dot(xv, w3);
++  }
++
++  partial[0][tid] = acc0; partial[1][tid] = acc1;
++  partial[2][tid] = acc2; partial[3][tid] = acc3;
++  barrier(CLK_LOCAL_MEM_FENCE);
++  for (int s = WG_SIZE >> 1; s > 0; s >>= 1) {
++    if (tid < s) {
++      partial[0][tid] += partial[0][tid + s];
++      partial[1][tid] += partial[1][tid + s];
++      partial[2][tid] += partial[2][tid + s];
++      partial[3][tid] += partial[3][tid + s];
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++  }
++  if (tid == 0) {
++    vstore_half(partial[0][0], 0, out + n_base + 0);
++    vstore_half(partial[1][0], 0, out + n_base + 1);
++    vstore_half(partial[2][0], 0, out + n_base + 2);
++    vstore_half(partial[3][0], 0, out + n_base + 3);
++  }
++}
++
++// K=576, vec4 fused gate+up SwiGLU with single output per WG.
++// Why not no4 + image: dual-accumulator (gate + up) with no4 = 8 fp32 accs
++// per thread → register spill on Adreno (Qwen Step 7 measured 1.78× regression).
++// Single-output keeps 2 fp32 accs/thread (safe), vec4 turns scalar 9-iter loop
++// into 2 vec4 iters + 16-thread tail. This kernel was the #1 hotspot
++// (35% of GPU time) at Step 3 — lots of headroom in the inner loop.
++__kernel
++__attribute__((reqd_work_group_size(WG_SIZE, 1, 1)))
++void fused_gate_up_silu_m1_v4(
++    __global const half* x,        // [H]
++    __global const half* w_gate,   // [INTER, H]
++    __global const half* w_up,     // [INTER, H]
++    __global half* out,            // [INTER]
++    const int H,
++    const int INTER) {
++  const int c   = (int)get_group_id(0);
++  const int tid = (int)get_local_id(0);
++  if (c >= INTER) return;
++
++  __local float ls_gate[WG_SIZE];
++  __local float ls_up  [WG_SIZE];
++
++  const int base = c * H;
++  float gate_acc = 0.0f, up_acc = 0.0f;
++
++  // 2 full waves of vec4 (covers 2*256 = 512 fp16 of K=576).
++  #pragma unroll
++  for (int j = 0; j < 2; ++j) {
++    const int off = j * (WG_SIZE * 4) + tid * 4;
++    float4 xv  = vload_half4(0, x + off);
++    float4 wgv = vload_half4(0, w_gate + base + off);
++    float4 wuv = vload_half4(0, w_up   + base + off);
++    gate_acc += dot(xv, wgv);
++    up_acc   += dot(xv, wuv);
++  }
++  // Tail: 64 fp16 = 16 vec4 → first 16 threads.
++  if (tid < 16) {
++    const int off = 2 * (WG_SIZE * 4) + tid * 4;
++    float4 xv  = vload_half4(0, x + off);
++    float4 wgv = vload_half4(0, w_gate + base + off);
++    float4 wuv = vload_half4(0, w_up   + base + off);
++    gate_acc += dot(xv, wgv);
++    up_acc   += dot(xv, wuv);
++  }
++
++  ls_gate[tid] = gate_acc;
++  ls_up  [tid] = up_acc;
++  barrier(CLK_LOCAL_MEM_FENCE);
++  for (int s = WG_SIZE >> 1; s > 0; s >>= 1) {
++    if (tid < s) {
++      ls_gate[tid] += ls_gate[tid + s];
++      ls_up  [tid] += ls_up  [tid + s];
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++  }
++  if (tid == 0) {
++    float g = ls_gate[0];
++    vstore_half((g / (1.0f + exp(-g))) * ls_up[0], c, out);
++  }
++}
++
++// K=576, image2d-backed Wgate AND Wup, single output per WG, vec4 inner loop.
++// no4 risks register spill (8 fp32 accs/thread — Qwen Step 7 regression).
++// Single-output keeps 2 accs/thread; texture cache provides the BW win.
++__kernel
++__attribute__((reqd_work_group_size(WG_SIZE, 1, 1)))
++void fused_gate_up_silu_m1_v4_img(
++    __global const half* x,                  // [H]
++    __read_only image2d_t Wg_img,            // [INTER, K_PIX]
++    __read_only image2d_t Wu_img,            // [INTER, K_PIX]
++    __global half* out,                      // [INTER]
++    const int INTER) {
++  const int c   = (int)get_group_id(0);
++  const int tid = (int)get_local_id(0);
++  if (c >= INTER) return;
++
++  __local float ls_gate[WG_SIZE];
++  __local float ls_up  [WG_SIZE];
++
++  float gate_acc = 0.0f, up_acc = 0.0f;
++
++  // K=576 = 2 vec4 waves + 16-thread tail (same layout as gemv_m1_k576_no4_img).
++  #pragma unroll
++  for (int j = 0; j < 2; ++j) {
++    const int x_off = j * (WG_SIZE * 4) + tid * 4;
++    const int pix   = j *  WG_SIZE      + tid;
++    float4 xv  = vload_half4(0, x + x_off);
++    float4 wgv = convert_float4(read_imageh(Wg_img, kImgSampler, (int2)(pix, c)));
++    float4 wuv = convert_float4(read_imageh(Wu_img, kImgSampler, (int2)(pix, c)));
++    gate_acc += dot(xv, wgv);
++    up_acc   += dot(xv, wuv);
++  }
++  if (tid < 16) {
++    const int x_off = 2 * (WG_SIZE * 4) + tid * 4;
++    const int pix   = 2 *  WG_SIZE      + tid;
++    float4 xv  = vload_half4(0, x + x_off);
++    float4 wgv = convert_float4(read_imageh(Wg_img, kImgSampler, (int2)(pix, c)));
++    float4 wuv = convert_float4(read_imageh(Wu_img, kImgSampler, (int2)(pix, c)));
++    gate_acc += dot(xv, wgv);
++    up_acc   += dot(xv, wuv);
++  }
++
++  ls_gate[tid] = gate_acc;
++  ls_up  [tid] = up_acc;
++  barrier(CLK_LOCAL_MEM_FENCE);
++  for (int s = WG_SIZE >> 1; s > 0; s >>= 1) {
++    if (tid < s) {
++      ls_gate[tid] += ls_gate[tid + s];
++      ls_up  [tid] += ls_up  [tid + s];
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++  }
++  if (tid == 0) {
++    float g = ls_gate[0];
++    vstore_half((g / (1.0f + exp(-g))) * ls_up[0], c, out);
++  }
++}
++
++// K=576, image2d-backed Wq/Wk/Wv, 4 outputs per WG.
++// Replaces fused_qkv_gemv_m1 buffer kernel (Q_DIM=576 + 2*KV_DIM=192 = 960 outputs).
++// Dispatch: gws = (Q_DIM + 2*KV_DIM) / 4 * WG_SIZE, lws = WG_SIZE.
++// All boundary conditions assume Q_DIM % 4 == 0 AND KV_DIM % 4 == 0.
++__kernel
++__attribute__((reqd_work_group_size(WG_SIZE, 1, 1)))
++void fused_qkv_gemv_m1_no4_img(
++    __global const half* x,
++    __read_only image2d_t Wq_img,
++    __read_only image2d_t Wk_img,
++    __read_only image2d_t Wv_img,
++    __global half* q_out,
++    __global half* k_out,
++    __global half* v_out,
++    const int Q_DIM_4,    // = Q_DIM / 4 (workgroup count for Q segment)
++    const int KV_DIM_4) { // = KV_DIM / 4 (workgroup count for K and V each)
++  const int gid_block = (int)get_group_id(0);
++  const int tid       = (int)get_local_id(0);
++
++  // Pick projection based on which segment this WG falls in. OpenCL forbids
++  // image2d_t variables, so we replicate the inner loop per segment branch.
++  const int seg = (gid_block < Q_DIM_4) ? 0
++                : (gid_block < Q_DIM_4 + KV_DIM_4) ? 1
++                : 2;
++  const int n_base = (seg == 0) ? gid_block * 4
++                  : (seg == 1) ? (gid_block - Q_DIM_4) * 4
++                              : (gid_block - Q_DIM_4 - KV_DIM_4) * 4;
++  __global half* OUT = (seg == 0) ? q_out
++                     : (seg == 1) ? k_out
++                                  : v_out;
++
++  __local float partial[4][WG_SIZE];
++  float acc0=0.0f, acc1=0.0f, acc2=0.0f, acc3=0.0f;
++
++#define QKV_NO4_INNER(W_IMG)                                                   \
++  do {                                                                         \
++    _Pragma("unroll")                                                          \
++    for (int j = 0; j < 2; ++j) {                                              \
++      const int x_off = j * (WG_SIZE * 4) + tid * 4;                           \
++      const int pix   = j *  WG_SIZE      + tid;                               \
++      float4 xv = vload_half4(0, x + x_off);                                   \
++      float4 w0 = convert_float4(read_imageh((W_IMG), kImgSampler, (int2)(pix, n_base + 0))); \
++      float4 w1 = convert_float4(read_imageh((W_IMG), kImgSampler, (int2)(pix, n_base + 1))); \
++      float4 w2 = convert_float4(read_imageh((W_IMG), kImgSampler, (int2)(pix, n_base + 2))); \
++      float4 w3 = convert_float4(read_imageh((W_IMG), kImgSampler, (int2)(pix, n_base + 3))); \
++      acc0 += dot(xv, w0); acc1 += dot(xv, w1);                                \
++      acc2 += dot(xv, w2); acc3 += dot(xv, w3);                                \
++    }                                                                          \
++    if (tid < 16) {                                                            \
++      const int x_off = 2 * (WG_SIZE * 4) + tid * 4;                           \
++      const int pix   = 2 *  WG_SIZE      + tid;                               \
++      float4 xv = vload_half4(0, x + x_off);                                   \
++      float4 w0 = convert_float4(read_imageh((W_IMG), kImgSampler, (int2)(pix, n_base + 0))); \
++      float4 w1 = convert_float4(read_imageh((W_IMG), kImgSampler, (int2)(pix, n_base + 1))); \
++      float4 w2 = convert_float4(read_imageh((W_IMG), kImgSampler, (int2)(pix, n_base + 2))); \
++      float4 w3 = convert_float4(read_imageh((W_IMG), kImgSampler, (int2)(pix, n_base + 3))); \
++      acc0 += dot(xv, w0); acc1 += dot(xv, w1);                                \
++      acc2 += dot(xv, w2); acc3 += dot(xv, w3);                                \
++    }                                                                          \
++  } while (0)
++
++  if      (seg == 0) { QKV_NO4_INNER(Wq_img); }
++  else if (seg == 1) { QKV_NO4_INNER(Wk_img); }
++  else               { QKV_NO4_INNER(Wv_img); }
++
++#undef QKV_NO4_INNER
++
++  partial[0][tid] = acc0; partial[1][tid] = acc1;
++  partial[2][tid] = acc2; partial[3][tid] = acc3;
++  barrier(CLK_LOCAL_MEM_FENCE);
++  for (int s = WG_SIZE >> 1; s > 0; s >>= 1) {
++    if (tid < s) {
++      partial[0][tid] += partial[0][tid + s];
++      partial[1][tid] += partial[1][tid + s];
++      partial[2][tid] += partial[2][tid + s];
++      partial[3][tid] += partial[3][tid + s];
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++  }
++  if (tid == 0) {
++    vstore_half(partial[0][0], 0, OUT + n_base + 0);
++    vstore_half(partial[1][0], 0, OUT + n_base + 1);
++    vstore_half(partial[2][0], 0, OUT + n_base + 2);
++    vstore_half(partial[3][0], 0, OUT + n_base + 3);
++  }
++}
++
++// K=576, image2d-backed W, 4 outputs per WG, fused residual add.
++// Replaces fused_oproj_residual_m1: out_proj.x → += residual.
++// N must be a multiple of 4. residual is INOUT.
++__kernel
++__attribute__((reqd_work_group_size(WG_SIZE, 1, 1)))
++void fused_oproj_residual_m1_no4_img(
++    __global const half* attn_out,        // [Q_DIM]
++    __read_only image2d_t Wo_img,         // [H, Q_DIM] as image
++    __global half* residual,              // [H] INOUT
++    const int H) {
++  const int n_base = (int)get_group_id(0) * 4;
++  const int tid    = (int)get_local_id(0);
++  if (n_base >= H) return;
++
++  __local float partial[4][WG_SIZE];
++  float acc0=0.0f, acc1=0.0f, acc2=0.0f, acc3=0.0f;
++
++  // 2 full waves of vec4 (covers 2*256 = 512 fp16 of K=576).
++  #pragma unroll
++  for (int j = 0; j < 2; ++j) {
++    const int x_off = j * (WG_SIZE * 4) + tid * 4;
++    const int pix   = j *  WG_SIZE      + tid;
++    float4 xv = vload_half4(0, attn_out + x_off);
++    float4 w0 = convert_float4(read_imageh(Wo_img, kImgSampler, (int2)(pix, n_base + 0)));
++    float4 w1 = convert_float4(read_imageh(Wo_img, kImgSampler, (int2)(pix, n_base + 1)));
++    float4 w2 = convert_float4(read_imageh(Wo_img, kImgSampler, (int2)(pix, n_base + 2)));
++    float4 w3 = convert_float4(read_imageh(Wo_img, kImgSampler, (int2)(pix, n_base + 3)));
++    acc0 += dot(xv, w0); acc1 += dot(xv, w1);
++    acc2 += dot(xv, w2); acc3 += dot(xv, w3);
++  }
++  if (tid < 16) {
++    const int x_off = 2 * (WG_SIZE * 4) + tid * 4;
++    const int pix   = 2 *  WG_SIZE      + tid;
++    float4 xv = vload_half4(0, attn_out + x_off);
++    float4 w0 = convert_float4(read_imageh(Wo_img, kImgSampler, (int2)(pix, n_base + 0)));
++    float4 w1 = convert_float4(read_imageh(Wo_img, kImgSampler, (int2)(pix, n_base + 1)));
++    float4 w2 = convert_float4(read_imageh(Wo_img, kImgSampler, (int2)(pix, n_base + 2)));
++    float4 w3 = convert_float4(read_imageh(Wo_img, kImgSampler, (int2)(pix, n_base + 3)));
++    acc0 += dot(xv, w0); acc1 += dot(xv, w1);
++    acc2 += dot(xv, w2); acc3 += dot(xv, w3);
++  }
++
++  partial[0][tid] = acc0; partial[1][tid] = acc1;
++  partial[2][tid] = acc2; partial[3][tid] = acc3;
++  barrier(CLK_LOCAL_MEM_FENCE);
++  for (int s = WG_SIZE >> 1; s > 0; s >>= 1) {
++    if (tid < s) {
++      partial[0][tid] += partial[0][tid + s];
++      partial[1][tid] += partial[1][tid + s];
++      partial[2][tid] += partial[2][tid + s];
++      partial[3][tid] += partial[3][tid + s];
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++  }
++  if (tid == 0) {
++    float r0 = vload_half(n_base + 0, residual);
++    float r1 = vload_half(n_base + 1, residual);
++    float r2 = vload_half(n_base + 2, residual);
++    float r3 = vload_half(n_base + 3, residual);
++    vstore_half(r0 + partial[0][0], n_base + 0, residual);
++    vstore_half(r1 + partial[1][0], n_base + 1, residual);
++    vstore_half(r2 + partial[2][0], n_base + 2, residual);
++    vstore_half(r3 + partial[3][0], n_base + 3, residual);
++  }
++}
++
++// K=1536 (INTERMEDIATE_SIZE), image2d-backed W, 4 outputs per WG, fused residual add.
++// Replaces fused_down_residual_m1. K_PIX = 1536/4 = 384 = 6*64 → 6 full waves, no tail.
++__kernel
++__attribute__((reqd_work_group_size(WG_SIZE, 1, 1)))
++void fused_down_residual_m1_no4_img(
++    __global const half* mlp_in,         // [INTER]
++    __read_only image2d_t Wd_img,        // [H, INTER] as image
++    __global half* residual,             // [H] INOUT
++    const int H) {
++  const int n_base = (int)get_group_id(0) * 4;
++  const int tid    = (int)get_local_id(0);
++  if (n_base >= H) return;
++
++  __local float partial[4][WG_SIZE];
++  float acc0=0.0f, acc1=0.0f, acc2=0.0f, acc3=0.0f;
++
++  // 6 full waves of vec4 (covers 6*256 = 1536 fp16 = full K), no tail.
++  #pragma unroll
++  for (int j = 0; j < 6; ++j) {
++    const int x_off = j * (WG_SIZE * 4) + tid * 4;
++    const int pix   = j *  WG_SIZE      + tid;
++    float4 xv = vload_half4(0, mlp_in + x_off);
++    float4 w0 = convert_float4(read_imageh(Wd_img, kImgSampler, (int2)(pix, n_base + 0)));
++    float4 w1 = convert_float4(read_imageh(Wd_img, kImgSampler, (int2)(pix, n_base + 1)));
++    float4 w2 = convert_float4(read_imageh(Wd_img, kImgSampler, (int2)(pix, n_base + 2)));
++    float4 w3 = convert_float4(read_imageh(Wd_img, kImgSampler, (int2)(pix, n_base + 3)));
++    acc0 += dot(xv, w0); acc1 += dot(xv, w1);
++    acc2 += dot(xv, w2); acc3 += dot(xv, w3);
++  }
++
++  partial[0][tid] = acc0; partial[1][tid] = acc1;
++  partial[2][tid] = acc2; partial[3][tid] = acc3;
++  barrier(CLK_LOCAL_MEM_FENCE);
++  for (int s = WG_SIZE >> 1; s > 0; s >>= 1) {
++    if (tid < s) {
++      partial[0][tid] += partial[0][tid + s];
++      partial[1][tid] += partial[1][tid + s];
++      partial[2][tid] += partial[2][tid + s];
++      partial[3][tid] += partial[3][tid + s];
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++  }
++  if (tid == 0) {
++    float r0 = vload_half(n_base + 0, residual);
++    float r1 = vload_half(n_base + 1, residual);
++    float r2 = vload_half(n_base + 2, residual);
++    float r3 = vload_half(n_base + 3, residual);
++    vstore_half(r0 + partial[0][0], n_base + 0, residual);
++    vstore_half(r1 + partial[1][0], n_base + 1, residual);
++    vstore_half(r2 + partial[2][0], n_base + 2, residual);
++    vstore_half(r3 + partial[3][0], n_base + 3, residual);
++  }
++}
++
++#endif // USE_FP16
++
+ // SCAFFOLD-EMITTED (above, ready to call from host code):
+ //   - fused_oproj_residual_m1      (every transformer)
+ //   - fused_down_residual_m1       (every MLP with down-proj)
+diff --git a/src/models/smollm2-135m-instruct/src/layers/attention.cpp b/src/models/smollm2-135m-instruct/src/layers/attention.cpp
+index f93d2ad..ec2402d 100644
+--- a/src/models/smollm2-135m-instruct/src/layers/attention.cpp
++++ b/src/models/smollm2-135m-instruct/src/layers/attention.cpp
+@@ -18,6 +18,7 @@
+ #include "prof.h"
+ #include <clblast.h>
+ #include <cmath>
++#include <cstring>
+ #include <string>
+ #include <vector>
+ 
+@@ -44,6 +45,13 @@ Attention::~Attention() {
+     if (fused_rope_kvwrite_m1_)   clReleaseKernel(fused_rope_kvwrite_m1_);
+     if (fused_decode_attn_m1_)    clReleaseKernel(fused_decode_attn_m1_);
+     if (fused_oproj_res_m1_)      clReleaseKernel(fused_oproj_res_m1_);
++    if (fused_qkv_no4_img_)       clReleaseKernel(fused_qkv_no4_img_);
++    if (gemv_k576_no4_img_)       clReleaseKernel(gemv_k576_no4_img_);
++    if (fused_oproj_no4_img_)     clReleaseKernel(fused_oproj_no4_img_);
++    if (wq_img_)                  clReleaseMemObject(wq_img_);
++    if (wk_img_)                  clReleaseMemObject(wk_img_);
++    if (wv_img_)                  clReleaseMemObject(wv_img_);
++    if (wo_img_)                  clReleaseMemObject(wo_img_);
+     if (block_fused_prog_)        clReleaseProgram(block_fused_prog_);
+ }
+ 
+@@ -234,6 +242,50 @@ bool Attention::initialize() {
+     if (berr || !decode_attn_out_buf_) { NNOPT_ERROR_FMT("alloc decode_attn_out_buf_ failed: %d", berr); return false; }
+     // decode_scores_buf_ is unused — scores live in kernel local memory.
+ 
++#ifdef NNOPT_USE_FP16
++    // Image2d_t-backed weight views (Adreno texture cache).
++    // K=576 (HIDDEN_SIZE) for all four. Wq is [576,576], Wk/Wv are [192,576],
++    // Wo is [576,576]. All well below CL_DEVICE_IMAGE2D_MAX_HEIGHT=16384.
++    fused_qkv_no4_img_   = nullptr;  // deprecated — fused-3-image variant regressed (branchy code).
++    gemv_k576_no4_img_   = clCreateKernel(block_fused_prog_, "gemv_m1_k576_no4_img", &err);
++    if (err != CL_SUCCESS) gemv_k576_no4_img_ = nullptr;
++    fused_oproj_no4_img_ = clCreateKernel(block_fused_prog_, "fused_oproj_residual_m1_no4_img", &err);
++    if (err != CL_SUCCESS) fused_oproj_no4_img_ = nullptr;
++
++    if (gemv_k576_no4_img_ || fused_oproj_no4_img_) {
++        const int H = MODEL_CONFIG::HIDDEN_SIZE;
++        const int K_PIX = H / 4;  // 144 vec4 pixels per row
++
++        cl_image_format fmt;
++        fmt.image_channel_order     = CL_RGBA;
++        fmt.image_channel_data_type = CL_HALF_FLOAT;
++
++        auto wrap = [&](cl_mem buf, int N) -> cl_mem {
++            cl_image_desc desc;
++            std::memset(&desc, 0, sizeof(desc));
++            desc.image_type      = CL_MEM_OBJECT_IMAGE2D;
++            desc.image_width     = (size_t)K_PIX;
++            desc.image_height    = (size_t)N;
++            desc.image_row_pitch = 0;
++            desc.buffer          = buf;
++            cl_int e = CL_SUCCESS;
++            cl_mem img = clCreateImage(bctx, CL_MEM_READ_ONLY, &fmt, &desc, nullptr, &e);
++            return (e == CL_SUCCESS) ? img : nullptr;
++        };
++
++        if (gemv_k576_no4_img_) {
++            wq_img_ = wrap(wq_, Q_DIM_CONST);
++            wk_img_ = wrap(wk_, KV_DIM_CONST);
++            wv_img_ = wrap(wv_, KV_DIM_CONST);
++            qkv_img_ready_ = (wq_img_ && wk_img_ && wv_img_);
++        }
++        if (fused_oproj_no4_img_) {
++            wo_img_ = wrap(wo_, Q_DIM_CONST);
++            oproj_img_ready_ = (wo_img_ != nullptr);
++        }
++    }
++#endif
++
+     NNOPT_LAYER_INIT_FMT("block%d_sub_attn", layer_idx_);
+     return true;
+ }
+@@ -536,18 +588,48 @@ bool Attention::forward_decode_into_residual(cl_command_queue queue,
+     cl_mem k = decode_k_buf_;
+     cl_mem v = decode_v_buf_;
+ 
+-    // 1. fused_qkv_gemv_m1: Q/K/V from x in one kernel.
+-    if (!_set_arg_checked(fused_qkv_m1_, 0, sizeof(cl_mem), &x,      "x"))      return false;
+-    if (!_set_arg_checked(fused_qkv_m1_, 1, sizeof(cl_mem), &wq_,    "w_q"))    return false;
+-    if (!_set_arg_checked(fused_qkv_m1_, 2, sizeof(cl_mem), &wk_,    "w_k"))    return false;
+-    if (!_set_arg_checked(fused_qkv_m1_, 3, sizeof(cl_mem), &wv_,    "w_v"))    return false;
+-    if (!_set_arg_checked(fused_qkv_m1_, 4, sizeof(cl_mem), &q,      "q_out"))  return false;
+-    if (!_set_arg_checked(fused_qkv_m1_, 5, sizeof(cl_mem), &k,      "k_out"))  return false;
+-    if (!_set_arg_checked(fused_qkv_m1_, 6, sizeof(cl_mem), &v,      "v_out"))  return false;
+-    if (!_set_arg_checked(fused_qkv_m1_, 7, sizeof(int),    &H,      "H"))      return false;
+-    if (!_set_arg_checked(fused_qkv_m1_, 8, sizeof(int),    &Q_DIM,  "Q_DIM"))  return false;
+-    if (!_set_arg_checked(fused_qkv_m1_, 9, sizeof(int),    &KV_DIM, "KV_DIM")) return false;
+-    {
++    // 1. QKV projection: prefer image2d_t no4 path (3 separate dispatches share x).
++    //    Fused-3-images variant regressed in early measurement — branchy code in
++    //    a single kernel (per-segment image select) hurt texture-cache flow.
++    //    Three back-to-back dispatches of the proven gemv_m1_k576_no4_img total
++    //    340ms vs 672ms for the fused variant.
++    if (qkv_img_ready_ && gemv_k576_no4_img_) {
++        const size_t WG = 64;
++        size_t lws = WG;
++        // Q
++        if (!_set_arg_checked(gemv_k576_no4_img_, 0, sizeof(cl_mem), &x,        "x"))        return false;
++        if (!_set_arg_checked(gemv_k576_no4_img_, 1, sizeof(cl_mem), &wq_img_,  "Wq_img"))   return false;
++        if (!_set_arg_checked(gemv_k576_no4_img_, 2, sizeof(cl_mem), &q,        "q_out"))    return false;
++        if (!_set_arg_checked(gemv_k576_no4_img_, 3, sizeof(int),    &Q_DIM,    "N=Q_DIM"))  return false;
++        size_t gws_q = (size_t)(Q_DIM / 4) * WG;
++        err = nnopt_prof::enqueue(queue, gemv_k576_no4_img_, 1, nullptr, &gws_q, &lws, 0, nullptr, nullptr);
++        if (err != CL_SUCCESS) { NNOPT_ERROR_FMT("gemv_m1_k576_no4_img(Q) failed: %d", err); return false; }
++        // K
++        if (!_set_arg_checked(gemv_k576_no4_img_, 0, sizeof(cl_mem), &x,        "x"))        return false;
++        if (!_set_arg_checked(gemv_k576_no4_img_, 1, sizeof(cl_mem), &wk_img_,  "Wk_img"))   return false;
++        if (!_set_arg_checked(gemv_k576_no4_img_, 2, sizeof(cl_mem), &k,        "k_out"))    return false;
++        if (!_set_arg_checked(gemv_k576_no4_img_, 3, sizeof(int),    &KV_DIM,   "N=KV_DIM")) return false;
++        size_t gws_k = (size_t)(KV_DIM / 4) * WG;
++        err = nnopt_prof::enqueue(queue, gemv_k576_no4_img_, 1, nullptr, &gws_k, &lws, 0, nullptr, nullptr);
++        if (err != CL_SUCCESS) { NNOPT_ERROR_FMT("gemv_m1_k576_no4_img(K) failed: %d", err); return false; }
++        // V
++        if (!_set_arg_checked(gemv_k576_no4_img_, 0, sizeof(cl_mem), &x,        "x"))        return false;
++        if (!_set_arg_checked(gemv_k576_no4_img_, 1, sizeof(cl_mem), &wv_img_,  "Wv_img"))   return false;
++        if (!_set_arg_checked(gemv_k576_no4_img_, 2, sizeof(cl_mem), &v,        "v_out"))    return false;
++        if (!_set_arg_checked(gemv_k576_no4_img_, 3, sizeof(int),    &KV_DIM,   "N=KV_DIM")) return false;
++        err = nnopt_prof::enqueue(queue, gemv_k576_no4_img_, 1, nullptr, &gws_k, &lws, 0, nullptr, nullptr);
++        if (err != CL_SUCCESS) { NNOPT_ERROR_FMT("gemv_m1_k576_no4_img(V) failed: %d", err); return false; }
++    } else {
++        if (!_set_arg_checked(fused_qkv_m1_, 0, sizeof(cl_mem), &x,      "x"))      return false;
++        if (!_set_arg_checked(fused_qkv_m1_, 1, sizeof(cl_mem), &wq_,    "w_q"))    return false;
++        if (!_set_arg_checked(fused_qkv_m1_, 2, sizeof(cl_mem), &wk_,    "w_k"))    return false;
++        if (!_set_arg_checked(fused_qkv_m1_, 3, sizeof(cl_mem), &wv_,    "w_v"))    return false;
++        if (!_set_arg_checked(fused_qkv_m1_, 4, sizeof(cl_mem), &q,      "q_out"))  return false;
++        if (!_set_arg_checked(fused_qkv_m1_, 5, sizeof(cl_mem), &k,      "k_out"))  return false;
++        if (!_set_arg_checked(fused_qkv_m1_, 6, sizeof(cl_mem), &v,      "v_out"))  return false;
++        if (!_set_arg_checked(fused_qkv_m1_, 7, sizeof(int),    &H,      "H"))      return false;
++        if (!_set_arg_checked(fused_qkv_m1_, 8, sizeof(int),    &Q_DIM,  "Q_DIM"))  return false;
++        if (!_set_arg_checked(fused_qkv_m1_, 9, sizeof(int),    &KV_DIM, "KV_DIM")) return false;
+         const size_t WG = 64;
+         size_t gws = (size_t)(Q_DIM + 2 * KV_DIM) * WG;
+         size_t lws = WG;
+@@ -602,14 +684,24 @@ bool Attention::forward_decode_into_residual(cl_command_queue queue,
+         if (err != CL_SUCCESS) { NNOPT_ERROR_FMT("fused_decode_attn_m1 failed: %d", err); return false; }
+     }
+ 
+-    // 4. fused_oproj_residual_m1: o_proj + residual add in one kernel.
++    // 4. o_proj + residual add: prefer image2d_t no4 path; fall back to buffer kernel.
+     cl_mem attn_out = decode_attn_out_buf_;
+-    if (!_set_arg_checked(fused_oproj_res_m1_, 0, sizeof(cl_mem), &attn_out, "attn_out")) return false;
+-    if (!_set_arg_checked(fused_oproj_res_m1_, 1, sizeof(cl_mem), &wo_,      "w_o"))      return false;
+-    if (!_set_arg_checked(fused_oproj_res_m1_, 2, sizeof(cl_mem), &residual, "residual")) return false;
+-    if (!_set_arg_checked(fused_oproj_res_m1_, 3, sizeof(int),    &H,        "H"))        return false;
+-    if (!_set_arg_checked(fused_oproj_res_m1_, 4, sizeof(int),    &Q_DIM,    "Q_DIM"))    return false;
+-    {
++    if (oproj_img_ready_ && fused_oproj_no4_img_) {
++        if (!_set_arg_checked(fused_oproj_no4_img_, 0, sizeof(cl_mem), &attn_out, "attn_out")) return false;
++        if (!_set_arg_checked(fused_oproj_no4_img_, 1, sizeof(cl_mem), &wo_img_,  "Wo_img"))   return false;
++        if (!_set_arg_checked(fused_oproj_no4_img_, 2, sizeof(cl_mem), &residual, "residual")) return false;
++        if (!_set_arg_checked(fused_oproj_no4_img_, 3, sizeof(int),    &H,        "H"))        return false;
++        const size_t WG = 64;
++        size_t gws = (size_t)(H / 4) * WG;
++        size_t lws = WG;
++        err = nnopt_prof::enqueue(queue, fused_oproj_no4_img_, 1, nullptr, &gws, &lws, 0, nullptr, nullptr);
++        if (err != CL_SUCCESS) { NNOPT_ERROR_FMT("fused_oproj_residual_m1_no4_img failed: %d", err); return false; }
++    } else {
++        if (!_set_arg_checked(fused_oproj_res_m1_, 0, sizeof(cl_mem), &attn_out, "attn_out")) return false;
++        if (!_set_arg_checked(fused_oproj_res_m1_, 1, sizeof(cl_mem), &wo_,      "w_o"))      return false;
++        if (!_set_arg_checked(fused_oproj_res_m1_, 2, sizeof(cl_mem), &residual, "residual")) return false;
++        if (!_set_arg_checked(fused_oproj_res_m1_, 3, sizeof(int),    &H,        "H"))        return false;
++        if (!_set_arg_checked(fused_oproj_res_m1_, 4, sizeof(int),    &Q_DIM,    "Q_DIM"))    return false;
+         const size_t WG = 64;
+         size_t gws = (size_t)H * WG;
+         size_t lws = WG;
+diff --git a/src/models/smollm2-135m-instruct/src/layers/attention.h b/src/models/smollm2-135m-instruct/src/layers/attention.h
+index 3723360..e58067a 100644
+--- a/src/models/smollm2-135m-instruct/src/layers/attention.h
++++ b/src/models/smollm2-135m-instruct/src/layers/attention.h
+@@ -103,4 +103,19 @@ private:
+     cl_mem wk_ = nullptr;
+     cl_mem wv_ = nullptr;
+     cl_mem wo_ = nullptr;
++
++    // ── Image2d_t-backed weight views (Adreno texture cache).
++    //   Built once in initialize() under fp16. K=576 = H = HIDDEN_SIZE,
++    //   so all four weights fit a single image (Wq is [576,576], Wk/Wv are
++    //   [192,576], Wo is [576,576] — none exceed image-height limit).
++    //   nullptr if image creation failed; layer falls back to buffer kernel.
++    cl_mem wq_img_ = nullptr;
++    cl_mem wk_img_ = nullptr;
++    cl_mem wv_img_ = nullptr;
++    cl_mem wo_img_ = nullptr;
++    cl_kernel fused_qkv_no4_img_      = nullptr;  // (deprecated, kept for compile)
++    cl_kernel gemv_k576_no4_img_      = nullptr;  // generic k=576 no4 image GEMV (used 3× for Q/K/V)
++    cl_kernel fused_oproj_no4_img_    = nullptr;  // fused_oproj_residual_m1_no4_img
++    bool      qkv_img_ready_   = false;
++    bool      oproj_img_ready_ = false;
+ };
+diff --git a/src/models/smollm2-135m-instruct/src/layers/lm_head.cpp b/src/models/smollm2-135m-instruct/src/layers/lm_head.cpp
+index e94176b..330d366 100644
+--- a/src/models/smollm2-135m-instruct/src/layers/lm_head.cpp
++++ b/src/models/smollm2-135m-instruct/src/layers/lm_head.cpp
+@@ -9,12 +9,21 @@
+ #include "model_config.h"
+ #include "prof.h"
+ #include <clblast.h>
++#include <cstring>
++#include <iostream>
+ #include <string>
+ 
+ LmHead::LmHead(OpenCLContext& cl_ctx, Weights& weights)
+     : cl_ctx_(cl_ctx), weights_(weights) {}
+ 
+ LmHead::~LmHead() {
++    for (auto& t : w_tiles_) {
++        if (t.image)      clReleaseMemObject(t.image);
++        if (t.sub_buffer) clReleaseMemObject(t.sub_buffer);
++        if (t.out_sub)    clReleaseMemObject(t.out_sub);
++    }
++    if (w_image_single_) clReleaseMemObject(w_image_single_);
++    if (gemv_k576_no4_img_) clReleaseKernel(gemv_k576_no4_img_);
+     if (fused_lm_head_m1_) clReleaseKernel(fused_lm_head_m1_);
+     if (block_fused_prog_) clReleaseProgram(block_fused_prog_);
+ }
+@@ -45,6 +54,110 @@ bool LmHead::initialize() {
+         return false;
+     }
+ 
++#ifdef NNOPT_USE_FP16
++    // Image2d_t-backed no4 GEMV (Adreno texture cache). USE_FP16-only.
++    // clCreateKernel on a missing kernel returns CL_INVALID_KERNEL_NAME — log and continue.
++    gemv_k576_no4_img_ = clCreateKernel(block_fused_prog_, "gemv_m1_k576_no4_img", &err);
++    if (err != CL_SUCCESS) gemv_k576_no4_img_ = nullptr;
++
++    // Try to wrap W (shape [V, H] = [49152, 576] fp16) as an image2d. The
++    // standard layout requires height ≤ CL_DEVICE_IMAGE2D_MAX_HEIGHT
++    // (typically 16384 on Adreno 6xx) — V=49152 will fail and fall through
++    // to tiling. Each tile is a clCreateSubBuffer + clCreateImage over the
++    // sub-buffer; the same gemv_m1_k576_no4_img kernel runs once per tile.
++    if (gemv_k576_no4_img_) {
++        cl_context  ctx = cl_ctx_.context();
++        cl_device_id dev = cl_ctx_.device();
++        const int H = MODEL_CONFIG::HIDDEN_SIZE;
++        const int V = MODEL_CONFIG::VOCAB_SIZE;
++        const int K_PIX = H / 4;  // 144 vec4-pixels per row
++
++        size_t img_max_w = 0, img_max_h = 0;
++        clGetDeviceInfo(dev, CL_DEVICE_IMAGE2D_MAX_WIDTH,  sizeof(img_max_w), &img_max_w, nullptr);
++        clGetDeviceInfo(dev, CL_DEVICE_IMAGE2D_MAX_HEIGHT, sizeof(img_max_h), &img_max_h, nullptr);
++
++        cl_image_format fmt;
++        fmt.image_channel_order     = CL_RGBA;
++        fmt.image_channel_data_type = CL_HALF_FLOAT;
++
++        auto try_image_over = [&](cl_mem buf, size_t pix_w, size_t pix_h) -> cl_mem {
++            if (pix_w == 0 || pix_h == 0) return nullptr;
++            if (pix_w > img_max_w || pix_h > img_max_h) return nullptr;
++            cl_image_desc desc;
++            std::memset(&desc, 0, sizeof(desc));
++            desc.image_type      = CL_MEM_OBJECT_IMAGE2D;
++            desc.image_width     = pix_w;
++            desc.image_height    = pix_h;
++            desc.image_row_pitch = 0;
++            desc.buffer          = buf;
++            cl_int e = CL_SUCCESS;
++            cl_mem img = clCreateImage(ctx, CL_MEM_READ_ONLY, &fmt, &desc, nullptr, &e);
++            if (e != CL_SUCCESS || !img) return nullptr;
++            return img;
++        };
++
++        // 1) Try single-image (works iff V ≤ img_max_h).
++        cl_mem one = try_image_over(w_, (size_t)K_PIX, (size_t)V);
++        if (one) {
++            w_image_single_ = one;
++            img_path_ready_ = true;
++        } else if ((size_t)K_PIX <= img_max_w && img_max_h > 0) {
++            // 2) Tile over rows. row_bytes = H*2 = 1152, divisible by 128
++            //    (Adreno sub-buffer alignment requirement). TILE_H must
++            //    keep rows_per_tile a multiple of 4 so per-tile dispatch
++            //    n_base alignment holds.
++            const int row_bytes = H * 2;  // fp16
++            int TILE_H = (int)img_max_h;
++            TILE_H -= (TILE_H % 4);  // align to 4 for no4 dispatch
++            if (TILE_H > 0 && (row_bytes % 128) == 0) {
++                int rows_left = V, row_offset = 0;
++                bool ok = true;
++                while (rows_left > 0) {
++                    int tile_n = rows_left < TILE_H ? rows_left : TILE_H;
++                    if ((tile_n % 4) != 0) { ok = false; break; }  // would skip outputs
++                    cl_buffer_region region;
++                    region.origin = (size_t)row_offset * (size_t)row_bytes;
++                    region.size   = (size_t)tile_n   * (size_t)row_bytes;
++                    cl_int e = CL_SUCCESS;
++                    cl_mem sub = clCreateSubBuffer(w_, CL_MEM_READ_ONLY,
++                                                   CL_BUFFER_CREATE_TYPE_REGION,
++                                                   &region, &e);
++                    if (e != CL_SUCCESS || !sub) { ok = false; break; }
++                    cl_mem sub_img = try_image_over(sub, (size_t)K_PIX, (size_t)tile_n);
++                    if (!sub_img) { clReleaseMemObject(sub); ok = false; break; }
++                    WImageTile t;
++                    t.sub_buffer = sub;
++                    t.image      = sub_img;
++                    t.row_offset = row_offset;
++                    t.row_count  = tile_n;
++                    t.out_sub    = nullptr;  // built lazily in forward() per output buffer
++                    w_tiles_.push_back(t);
++                    row_offset += tile_n;
++                    rows_left  -= tile_n;
++                }
++                if (ok && !w_tiles_.empty()) {
++                    img_path_ready_ = true;
++                } else {
++                    for (auto& t : w_tiles_) {
++                        if (t.image)      clReleaseMemObject(t.image);
++                        if (t.sub_buffer) clReleaseMemObject(t.sub_buffer);
++                    }
++                    w_tiles_.clear();
++                }
++            }
++        }
++        if (img_path_ready_) {
++            std::cerr << "LmHead: image2d path ready ("
++                      << (w_image_single_ ? "single image" : "tiled, ")
++                      << (w_image_single_ ? "" : std::to_string(w_tiles_.size()) + " tiles")
++                      << ", img_max=" << img_max_w << "x" << img_max_h << ")" << std::endl;
++        } else {
++            std::cerr << "LmHead: image2d path unavailable, using buffer kernel "
++                      << "(img_max=" << img_max_w << "x" << img_max_h << ")" << std::endl;
++        }
++    }
++#endif // NNOPT_USE_FP16
++
+     NNOPT_LAYER_INIT("lm_head");
+     return true;
+ }
+@@ -64,6 +177,62 @@ cl_mem LmHead::forward(cl_command_queue queue, cl_mem hidden, int M) {
+         return nullptr;
+     }
+ 
++    if (M == 1 && img_path_ready_ && gemv_k576_no4_img_) {
++        // ── Image-backed decode fast path ──
++        // Single-image: one dispatch over the whole V×H weight as one image.
++        // Tiled: dispatch per tile, writing to a sub-buffer of `out` covering
++        // that tile's row range. Sub-buffers are cached per tile so we don't
++        // pay clCreateSubBuffer cost on every decode step.
++        const int K_PIX = H / 4;
++        (void)K_PIX;
++
++        if (w_image_single_) {
++            err = clSetKernelArg(gemv_k576_no4_img_, 0, sizeof(cl_mem), &hidden);          if (err != CL_SUCCESS) goto img_failed;
++            err = clSetKernelArg(gemv_k576_no4_img_, 1, sizeof(cl_mem), &w_image_single_); if (err != CL_SUCCESS) goto img_failed;
++            err = clSetKernelArg(gemv_k576_no4_img_, 2, sizeof(cl_mem), &out);             if (err != CL_SUCCESS) goto img_failed;
++            err = clSetKernelArg(gemv_k576_no4_img_, 3, sizeof(int),    &V);               if (err != CL_SUCCESS) goto img_failed;
++            const size_t WG = 64;
++            size_t gws = (size_t)(V / 4) * WG;
++            size_t lws = WG;
++            err = nnopt_prof::enqueue(queue, gemv_k576_no4_img_, 1, nullptr, &gws, &lws, 0, nullptr, nullptr);
++            if (err != CL_SUCCESS) goto img_failed;
++        } else {
++            // Tiled path. `out` changes between calls (allocated above), so
++            // we build per-tile sub-buffers per call. Cheap on Adreno (~µs)
++            // but in a future pass move to persistent decode_logits_buf_
++            // and cache the sub-buffers.
++            const size_t out_row_bytes = sizeof(nnopt_storage_t);  // fp16 = 2
++            for (auto& t : w_tiles_) {
++                cl_buffer_region region;
++                region.origin = (size_t)t.row_offset * out_row_bytes;
++                region.size   = (size_t)t.row_count  * out_row_bytes;
++                cl_mem out_sub = clCreateSubBuffer(out, CL_MEM_READ_WRITE,
++                                                   CL_BUFFER_CREATE_TYPE_REGION,
++                                                   &region, &err);
++                if (err != CL_SUCCESS || !out_sub) { NNOPT_ERROR_FMT("lm_head tile out_sub failed: %d", err); goto img_failed; }
++
++                err = clSetKernelArg(gemv_k576_no4_img_, 0, sizeof(cl_mem), &hidden);  if (err != CL_SUCCESS) { clReleaseMemObject(out_sub); goto img_failed; }
++                err = clSetKernelArg(gemv_k576_no4_img_, 1, sizeof(cl_mem), &t.image); if (err != CL_SUCCESS) { clReleaseMemObject(out_sub); goto img_failed; }
++                err = clSetKernelArg(gemv_k576_no4_img_, 2, sizeof(cl_mem), &out_sub); if (err != CL_SUCCESS) { clReleaseMemObject(out_sub); goto img_failed; }
++                int tile_n = t.row_count;
++                err = clSetKernelArg(gemv_k576_no4_img_, 3, sizeof(int),    &tile_n);  if (err != CL_SUCCESS) { clReleaseMemObject(out_sub); goto img_failed; }
++
++                const size_t WG = 64;
++                size_t gws = (size_t)(tile_n / 4) * WG;
++                size_t lws = WG;
++                err = nnopt_prof::enqueue(queue, gemv_k576_no4_img_, 1, nullptr, &gws, &lws, 0, nullptr, nullptr);
++                clReleaseMemObject(out_sub);
++                if (err != CL_SUCCESS) goto img_failed;
++            }
++        }
++        NNOPT_LAYER_CHECK("lm_head", queue, out, (size_t)M * (size_t)V);
++        return out;
++
++      img_failed:
++        NNOPT_ERROR_FMT("lm_head image dispatch failed: %d — falling through to buffer kernel", err);
++        // Fall through to buffer fast path or CLBlast.
++    }
++
+     if (M == 1 && fused_lm_head_m1_) {
+         // Decode fast path: GEMV — one workgroup per output token, 64 threads cooperative.
+         auto sa = [&](cl_uint idx, size_t sz, const void* v, const char* n) -> bool {
+diff --git a/src/models/smollm2-135m-instruct/src/layers/lm_head.h b/src/models/smollm2-135m-instruct/src/layers/lm_head.h
+index 4078f62..1a99297 100644
+--- a/src/models/smollm2-135m-instruct/src/layers/lm_head.h
++++ b/src/models/smollm2-135m-instruct/src/layers/lm_head.h
+@@ -3,6 +3,7 @@
+ // lm_head is a simple linear projection from hidden_size -> vocab.
+ 
+ #include <CL/cl.h>
++#include <vector>
+ 
+ class OpenCLContext;
+ class Weights;
+@@ -29,4 +30,20 @@ private:
+     // Decode fast-path GEMV (M=1) — dispatched automatically from forward() when M==1.
+     cl_program block_fused_prog_ = nullptr;
+     cl_kernel fused_lm_head_m1_ = nullptr;
++
++    // Image2d_t-backed no4 kernel + tiled views over W.
++    // Tiling required because VOCAB=49152 typically exceeds Adreno's
++    // CL_DEVICE_IMAGE2D_MAX_HEIGHT (16384). Each tile owns a sub-buffer
++    // over W and an image2d created from that sub-buffer.
++    cl_kernel gemv_k576_no4_img_ = nullptr;
++    struct WImageTile {
++        cl_mem sub_buffer = nullptr;
++        cl_mem image      = nullptr;
++        int    row_offset = 0;
++        int    row_count  = 0;
++        cl_mem out_sub    = nullptr;  // pre-created sub-buffer of decode_logits_buf_
++    };
++    std::vector<WImageTile> w_tiles_;
++    cl_mem  w_image_single_ = nullptr;  // single-image fast path (if W fits)
++    bool    img_path_ready_ = false;
+ };
+diff --git a/src/models/smollm2-135m-instruct/src/layers/mlp.cpp b/src/models/smollm2-135m-instruct/src/layers/mlp.cpp
+index e6d80a8..dbeaf74 100644
+--- a/src/models/smollm2-135m-instruct/src/layers/mlp.cpp
++++ b/src/models/smollm2-135m-instruct/src/layers/mlp.cpp
+@@ -9,6 +9,7 @@
+ #include "prof.h"
+ #include <clblast.h>
+ #include <cmath>
++#include <cstring>
+ #include <string>
+ #include <vector>
+ 
+@@ -29,7 +30,13 @@ Mlp::~Mlp() {
+     if (silu_mul_kernel_) clReleaseKernel(silu_mul_kernel_);
+     if (mlp_program_) clReleaseProgram(mlp_program_);
+     if (fused_gate_up_silu_m1_) clReleaseKernel(fused_gate_up_silu_m1_);
++    if (fused_gate_up_silu_m1_v4_) clReleaseKernel(fused_gate_up_silu_m1_v4_);
++    if (fused_gate_up_silu_m1_v4_img_) clReleaseKernel(fused_gate_up_silu_m1_v4_img_);
+     if (fused_down_res_m1_) clReleaseKernel(fused_down_res_m1_);
++    if (fused_down_no4_img_) clReleaseKernel(fused_down_no4_img_);
++    if (w_down_img_) clReleaseMemObject(w_down_img_);
++    if (w_gate_img_) clReleaseMemObject(w_gate_img_);
++    if (w_up_img_)   clReleaseMemObject(w_up_img_);
+     if (block_fused_prog_) clReleaseProgram(block_fused_prog_);
+ }
+ 
+@@ -67,6 +74,14 @@ bool Mlp::initialize() {
+         NNOPT_ERROR_FMT("clCreateKernel fused_gate_up_silu_m1 failed: %d", err);
+         return false;
+     }
++#ifdef NNOPT_USE_FP16
++    // vec4 variant — 2 fp32 accumulators per thread, vec4 inner loop.
++    // K=576 = 2 vec4 waves + 16-thread tail. Falls back to scalar if missing.
++    fused_gate_up_silu_m1_v4_ = clCreateKernel(block_fused_prog_, "fused_gate_up_silu_m1_v4", &err);
++    if (err != CL_SUCCESS) fused_gate_up_silu_m1_v4_ = nullptr;
++    fused_gate_up_silu_m1_v4_img_ = clCreateKernel(block_fused_prog_, "fused_gate_up_silu_m1_v4_img", &err);
++    if (err != CL_SUCCESS) fused_gate_up_silu_m1_v4_img_ = nullptr;
++#endif
+     fused_down_res_m1_ = clCreateKernel(block_fused_prog_, "fused_down_residual_m1", &err);
+     if (err != CL_SUCCESS || !fused_down_res_m1_) {
+         NNOPT_ERROR_FMT("clCreateKernel fused_down_residual_m1 failed: %d", err);
+@@ -75,6 +90,47 @@ bool Mlp::initialize() {
+ 
+     if (!set_weights()) return false;
+ 
++#ifdef NNOPT_USE_FP16
++    // Image2d_t-backed Wdown view (Adreno texture cache).
++    // Wdown shape [H=576, INTER=1536]. K=INTER=1536 → K_PIX=384, height=576.
++    // Both well under image2d limits.
++    fused_down_no4_img_ = clCreateKernel(block_fused_prog_, "fused_down_residual_m1_no4_img", &err);
++    if (err != CL_SUCCESS) fused_down_no4_img_ = nullptr;
++
++    {
++        const int H     = MODEL_CONFIG::HIDDEN_SIZE;
++        const int INTER = MODEL_CONFIG::INTERMEDIATE_SIZE;
++        cl_image_format fmt;
++        fmt.image_channel_order     = CL_RGBA;
++        fmt.image_channel_data_type = CL_HALF_FLOAT;
++
++        auto wrap = [&](cl_mem buf, size_t pix_w, size_t pix_h) -> cl_mem {
++            cl_image_desc desc;
++            std::memset(&desc, 0, sizeof(desc));
++            desc.image_type      = CL_MEM_OBJECT_IMAGE2D;
++            desc.image_width     = pix_w;
++            desc.image_height    = pix_h;
++            desc.image_row_pitch = 0;
++            desc.buffer          = buf;
++            cl_int e = CL_SUCCESS;
++            cl_mem img = clCreateImage(cl_ctx_.context(), CL_MEM_READ_ONLY, &fmt, &desc, nullptr, &e);
++            return (e == CL_SUCCESS) ? img : nullptr;
++        };
++
++        // Wdown: shape [H=576, INTER=1536]. K_PIX = 384, height = 576.
++        if (fused_down_no4_img_ && w_down_) {
++            w_down_img_ = wrap(w_down_, (size_t)(INTER / 4), (size_t)H);
++            down_img_ready_ = (w_down_img_ != nullptr);
++        }
++        // Wgate / Wup: shape [INTER=1536, H=576]. K_PIX = 144, height = 1536.
++        if (fused_gate_up_silu_m1_v4_img_ && w_gate_ && w_up_) {
++            w_gate_img_ = wrap(w_gate_, (size_t)(H / 4), (size_t)INTER);
++            w_up_img_   = wrap(w_up_,   (size_t)(H / 4), (size_t)INTER);
++            gate_up_img_ready_ = (w_gate_img_ && w_up_img_);
++        }
++    }
++#endif
++
+     // Pre-allocate persistent decode intermediate buffer.
+     cl_int berr = CL_SUCCESS;
+     decode_act_buf_ = clCreateBuffer(cl_ctx_.context(), CL_MEM_READ_WRITE,
+@@ -176,28 +232,52 @@ bool Mlp::forward_decode_into_residual(cl_command_queue queue, cl_mem x, cl_mem
+     // Use persistent decode buffer — no allocation per step.
+     cl_mem act = decode_act_buf_;
+ 
+-    // 1. fused_gate_up_silu_m1: silu(Wgate*x) * (Wup*x) -> act[I]
+-    if (!set_arg_checked(fused_gate_up_silu_m1_, 0, sizeof(cl_mem), &x,      "x"))     return false;
+-    if (!set_arg_checked(fused_gate_up_silu_m1_, 1, sizeof(cl_mem), &w_gate_,"w_gate"))return false;
+-    if (!set_arg_checked(fused_gate_up_silu_m1_, 2, sizeof(cl_mem), &w_up_,  "w_up"))  return false;
+-    if (!set_arg_checked(fused_gate_up_silu_m1_, 3, sizeof(cl_mem), &act,    "out"))   return false;
+-    if (!set_arg_checked(fused_gate_up_silu_m1_, 4, sizeof(int),    &H,      "H"))     return false;
+-    if (!set_arg_checked(fused_gate_up_silu_m1_, 5, sizeof(int),    &I,      "INTER")) return false;
+-    {
++    // 1. silu(Wgate*x) * (Wup*x) -> act[I]. Path priority:
++    //    image+vec4 > buffer+vec4 > buffer scalar.
++    if (gate_up_img_ready_ && fused_gate_up_silu_m1_v4_img_) {
++        cl_kernel gu = fused_gate_up_silu_m1_v4_img_;
++        if (!set_arg_checked(gu, 0, sizeof(cl_mem), &x,           "x"))         return false;
++        if (!set_arg_checked(gu, 1, sizeof(cl_mem), &w_gate_img_, "Wg_img"))    return false;
++        if (!set_arg_checked(gu, 2, sizeof(cl_mem), &w_up_img_,   "Wu_img"))    return false;
++        if (!set_arg_checked(gu, 3, sizeof(cl_mem), &act,         "out"))       return false;
++        if (!set_arg_checked(gu, 4, sizeof(int),    &I,           "INTER"))     return false;
++        const size_t WG = 64;
++        size_t gws = (size_t)I * WG;
++        size_t lws = WG;
++        err = nnopt_prof::enqueue(queue, gu, 1, nullptr, &gws, &lws, 0, nullptr, nullptr);
++        if (err != CL_SUCCESS) { NNOPT_ERROR_FMT("fused_gate_up_silu_m1_v4_img failed: %d", err); return false; }
++    } else {
++        cl_kernel gu_kernel = fused_gate_up_silu_m1_v4_ ? fused_gate_up_silu_m1_v4_ : fused_gate_up_silu_m1_;
++        if (!set_arg_checked(gu_kernel, 0, sizeof(cl_mem), &x,      "x"))     return false;
++        if (!set_arg_checked(gu_kernel, 1, sizeof(cl_mem), &w_gate_,"w_gate"))return false;
++        if (!set_arg_checked(gu_kernel, 2, sizeof(cl_mem), &w_up_,  "w_up"))  return false;
++        if (!set_arg_checked(gu_kernel, 3, sizeof(cl_mem), &act,    "out"))   return false;
++        if (!set_arg_checked(gu_kernel, 4, sizeof(int),    &H,      "H"))     return false;
++        if (!set_arg_checked(gu_kernel, 5, sizeof(int),    &I,      "INTER")) return false;
+         const size_t WG = 64;
+         size_t gws = (size_t)I * WG;
+         size_t lws = WG;
+-        err = nnopt_prof::enqueue(queue, fused_gate_up_silu_m1_, 1, nullptr, &gws, &lws, 0, nullptr, nullptr);
+-        if (err != CL_SUCCESS) { NNOPT_ERROR_FMT("fused_gate_up_silu_m1 failed: %d", err); return false; }
++        err = nnopt_prof::enqueue(queue, gu_kernel, 1, nullptr, &gws, &lws, 0, nullptr, nullptr);
++        if (err != CL_SUCCESS) { NNOPT_ERROR_FMT("fused_gate_up_silu_m1[_v4] failed: %d", err); return false; }
+     }
+ 
+-    // 2. fused_down_residual_m1: Wdown*act + residual -> residual in-place.
+-    if (!set_arg_checked(fused_down_res_m1_, 0, sizeof(cl_mem), &act,      "mlp_in"))  return false;
+-    if (!set_arg_checked(fused_down_res_m1_, 1, sizeof(cl_mem), &w_down_,  "w_down"))  return false;
+-    if (!set_arg_checked(fused_down_res_m1_, 2, sizeof(cl_mem), &residual, "residual"))return false;
+-    if (!set_arg_checked(fused_down_res_m1_, 3, sizeof(int),    &H,        "K"))       return false;
+-    if (!set_arg_checked(fused_down_res_m1_, 4, sizeof(int),    &I,        "N"))       return false;
+-    {
++    // 2. Wdown*act + residual: prefer image2d_t no4 path; fall back to buffer kernel.
++    if (down_img_ready_ && fused_down_no4_img_) {
++        if (!set_arg_checked(fused_down_no4_img_, 0, sizeof(cl_mem), &act,         "mlp_in"))   return false;
++        if (!set_arg_checked(fused_down_no4_img_, 1, sizeof(cl_mem), &w_down_img_, "Wd_img"))   return false;
++        if (!set_arg_checked(fused_down_no4_img_, 2, sizeof(cl_mem), &residual,    "residual")) return false;
++        if (!set_arg_checked(fused_down_no4_img_, 3, sizeof(int),    &H,           "H"))        return false;
++        const size_t WG = 64;
++        size_t gws = (size_t)(H / 4) * WG;
++        size_t lws = WG;
++        err = nnopt_prof::enqueue(queue, fused_down_no4_img_, 1, nullptr, &gws, &lws, 0, nullptr, nullptr);
++        if (err != CL_SUCCESS) { NNOPT_ERROR_FMT("fused_down_residual_m1_no4_img failed: %d", err); return false; }
++    } else {
++        if (!set_arg_checked(fused_down_res_m1_, 0, sizeof(cl_mem), &act,      "mlp_in"))  return false;
++        if (!set_arg_checked(fused_down_res_m1_, 1, sizeof(cl_mem), &w_down_,  "w_down"))  return false;
++        if (!set_arg_checked(fused_down_res_m1_, 2, sizeof(cl_mem), &residual, "residual"))return false;
++        if (!set_arg_checked(fused_down_res_m1_, 3, sizeof(int),    &H,        "K"))       return false;
++        if (!set_arg_checked(fused_down_res_m1_, 4, sizeof(int),    &I,        "N"))       return false;
+         const size_t WG = 64;
+         size_t gws = (size_t)H * WG;
+         size_t lws = WG;
+diff --git a/src/models/smollm2-135m-instruct/src/layers/mlp.h b/src/models/smollm2-135m-instruct/src/layers/mlp.h
+index 61eb494..06f7646 100644
+--- a/src/models/smollm2-135m-instruct/src/layers/mlp.h
++++ b/src/models/smollm2-135m-instruct/src/layers/mlp.h
+@@ -31,6 +31,8 @@ private:
+     // Decode fast-path kernels (block_fused.cl)
+     cl_program block_fused_prog_ = nullptr;
+     cl_kernel fused_gate_up_silu_m1_ = nullptr;
++    cl_kernel fused_gate_up_silu_m1_v4_ = nullptr;  // vec4 inner loop (buffer)
++    cl_kernel fused_gate_up_silu_m1_v4_img_ = nullptr;  // vec4 + image2d_t (preferred)
+     cl_kernel fused_down_res_m1_ = nullptr;
+ 
+     // Persistent decode buffer — allocated once in initialize().
+@@ -39,4 +41,13 @@ private:
+     cl_mem w_gate_ = nullptr;
+     cl_mem w_up_ = nullptr;
+     cl_mem w_down_ = nullptr;
++
++    // Image2d_t-backed view of w_down_ (Adreno texture cache).
++    // K=INTERMEDIATE_SIZE=1536; output dim H=576 fits one image easily.
++    cl_mem w_down_img_ = nullptr;
++    cl_mem w_gate_img_ = nullptr;
++    cl_mem w_up_img_   = nullptr;
++    cl_kernel fused_down_no4_img_ = nullptr;  // fused_down_residual_m1_no4_img
++    bool      down_img_ready_     = false;
++    bool      gate_up_img_ready_  = false;
+ };
+diff --git a/src/models/smollm2-135m-instruct/src/model.cpp b/src/models/smollm2-135m-instruct/src/model.cpp
+index 06db6c1..a6c394d 100644
+--- a/src/models/smollm2-135m-instruct/src/model.cpp
++++ b/src/models/smollm2-135m-instruct/src/model.cpp
+@@ -7,6 +7,7 @@
+ #include "utils.h"
+ #include "model_config.h"
+ #include "benchmark.h"
++#include "prof.h"
+ #include <CL/cl.h>
+ #include <clblast.h>
+ #include <iostream>
+@@ -34,7 +35,133 @@ Model::Model(OpenCLContext& cl_ctx, Weights& weights)
+     }
+ }
+ 
+-Model::~Model() {}
++Model::~Model() {
++    if (argmax_partial_)   clReleaseKernel(argmax_partial_);
++    if (argmax_final_)     clReleaseKernel(argmax_final_);
++    if (argmax_prog_)      clReleaseProgram(argmax_prog_);
++    if (argmax_scratch_v_) clReleaseMemObject(argmax_scratch_v_);
++    if (argmax_scratch_i_) clReleaseMemObject(argmax_scratch_i_);
++    if (argmax_out_idx_)   clReleaseMemObject(argmax_out_idx_);
++    if (argmax_cur_token_) clReleaseMemObject(argmax_cur_token_);
++}
++
++bool Model::ensure_argmax_program(cl_command_queue queue) {
++    if (argmax_tried_) return argmax_ready_;
++    argmax_tried_ = true;
++
++    constexpr int NUM_WG = 32;
++
++    cl_context ctx = cl_ctx_.context();
++    cl_int err = CL_SUCCESS;
++
++    argmax_prog_ = cl_ctx_.build_program_from_file(
++        "kernels/argmax.cl",
++#ifdef NNOPT_USE_FP16
++        "-DNNOPT_USE_FP16=1 -DUSE_FP16=1 -DNUM_WG=32"
++#else
++        "-DNUM_WG=32"
++#endif
++    );
++    if (!argmax_prog_) {
++        NNOPT_ERROR("Failed to build kernels/argmax.cl");
++        return false;
++    }
++    argmax_partial_ = clCreateKernel(argmax_prog_, "argmax_partial", &err);
++    if (err != CL_SUCCESS) { NNOPT_ERROR_FMT("argmax_partial kernel failed: %d", err); return false; }
++    argmax_final_ = clCreateKernel(argmax_prog_, "argmax_final", &err);
++    if (err != CL_SUCCESS) { NNOPT_ERROR_FMT("argmax_final kernel failed: %d", err); return false; }
++
++    argmax_scratch_v_ = clCreateBuffer(ctx, CL_MEM_READ_WRITE, NUM_WG * sizeof(float), nullptr, &err);
++    if (err != CL_SUCCESS) return false;
++    argmax_scratch_i_ = clCreateBuffer(ctx, CL_MEM_READ_WRITE, NUM_WG * sizeof(int),   nullptr, &err);
++    if (err != CL_SUCCESS) return false;
++    argmax_out_idx_   = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(int), nullptr, &err);
++    if (err != CL_SUCCESS) return false;
++    argmax_cur_token_ = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(int), nullptr, &err);
++    if (err != CL_SUCCESS) return false;
++
++    (void)queue;
++    argmax_ready_ = true;
++    return true;
++}
++
++int32_t Model::forward_decode_greedy(int32_t token_id, int start_pos) {
++    cl_command_queue queue = cl_ctx_.queue();
++    cl_context ctx = cl_ctx_.context();
++    cl_int err = CL_SUCCESS;
++
++    if (!ensure_argmax_program(queue)) return -1;
++
++    // 1. Token embedding.
++    const std::vector<int32_t> single_id = { token_id };
++    cl_mem ids_buf = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
++                                    sizeof(int32_t), (void*)single_id.data(), &err);
++    if (err != CL_SUCCESS || !ids_buf) return -1;
++    cl_mem hidden = embed_tokens_->forward(queue, ids_buf, 1);
++    clReleaseMemObject(ids_buf);
++    if (!hidden) return -1;
++
++    // 2. Transformer layers (same as forward_decode).
++    for (int i = 0; i < MODEL_CONFIG::NUM_HIDDEN_LAYERS; i++) {
++        cl_mem normed = input_layernorm_[i]->forward_decode(queue, hidden);
++        if (!normed) { clReleaseMemObject(hidden); return -1; }
++        if (!self_attn_[i]->forward_decode_into_residual(queue, normed, start_pos, hidden)) {
++            clReleaseMemObject(hidden); return -1;
++        }
++        cl_mem normed2 = post_attention_layernorm_[i]->forward_decode(queue, hidden);
++        if (!normed2) { clReleaseMemObject(hidden); return -1; }
++        if (!mlp_[i]->forward_decode_into_residual(queue, normed2, hidden)) {
++            clReleaseMemObject(hidden); return -1;
++        }
++    }
++
++    cl_mem final_hidden = final_norm_->forward_decode(queue, hidden);
++    clReleaseMemObject(hidden);
++    if (!final_hidden) return -1;
++
++    cl_mem logits_buf = lm_head_->forward(queue, final_hidden, 1);
++    if (!logits_buf) return -1;
++
++    // 3. GPU argmax — two-pass cooperative reduce.
++    constexpr int NUM_WG = 32;
++    constexpr int WG_SIZE = 64;
++    const int V = MODEL_CONFIG::VOCAB_SIZE;
++    const int row_off = 0;
++    const int write_off = 0;
++    const int valid_n = V;
++
++    err  = clSetKernelArg(argmax_partial_, 0, sizeof(cl_mem), &logits_buf);
++    err |= clSetKernelArg(argmax_partial_, 1, sizeof(cl_mem), &argmax_scratch_v_);
++    err |= clSetKernelArg(argmax_partial_, 2, sizeof(cl_mem), &argmax_scratch_i_);
++    err |= clSetKernelArg(argmax_partial_, 3, sizeof(int),    &V);
++    err |= clSetKernelArg(argmax_partial_, 4, sizeof(int),    &valid_n);
++    err |= clSetKernelArg(argmax_partial_, 5, sizeof(int),    &row_off);
++    if (err != CL_SUCCESS) { clReleaseMemObject(logits_buf); return -1; }
++    {
++        size_t gws = (size_t)NUM_WG * WG_SIZE;
++        size_t lws = WG_SIZE;
++        err = nnopt_prof::enqueue(queue, argmax_partial_, 1, nullptr, &gws, &lws, 0, nullptr, nullptr);
++        if (err != CL_SUCCESS) { clReleaseMemObject(logits_buf); return -1; }
++    }
++    err  = clSetKernelArg(argmax_final_, 0, sizeof(cl_mem), &argmax_scratch_v_);
++    err |= clSetKernelArg(argmax_final_, 1, sizeof(cl_mem), &argmax_scratch_i_);
++    err |= clSetKernelArg(argmax_final_, 2, sizeof(cl_mem), &argmax_out_idx_);
++    err |= clSetKernelArg(argmax_final_, 3, sizeof(cl_mem), &argmax_cur_token_);
++    err |= clSetKernelArg(argmax_final_, 4, sizeof(int),    &write_off);
++    if (err != CL_SUCCESS) { clReleaseMemObject(logits_buf); return -1; }
++    {
++        size_t gws = NUM_WG, lws = NUM_WG;
++        err = nnopt_prof::enqueue(queue, argmax_final_, 1, nullptr, &gws, &lws, 0, nullptr, nullptr);
++        if (err != CL_SUCCESS) { clReleaseMemObject(logits_buf); return -1; }
++    }
++
++    // 4. Read back single int (4 bytes) instead of 98 KB of logits.
++    int32_t out = -1;
++    err = clEnqueueReadBuffer(queue, argmax_out_idx_, CL_TRUE, 0, sizeof(int32_t), &out, 0, nullptr, nullptr);
++    clReleaseMemObject(logits_buf);
++    if (err != CL_SUCCESS) return -1;
++    return out;
++}
+ 
+ // Per-layer instance + kernel construction. Return false on the FIRST
+ // per-layer failure — main.cpp checks the return and exits non-zero so the
+@@ -481,17 +608,37 @@ std::vector<int32_t> Model::generate(
+     // absolute position of that new token. Attention reuses cached K/V for
+     // all prior tokens — work per step is O(layers * (hidden + seq_k * head_dim)),
+     // not O((P + i)^2 * ...) like a re-prefill loop.
++    //
++    // GPU-argmax fast path: when sampler is pure greedy (temp ≤ 0,
++    // rep_penalty == 1), we run argmax on the GPU and read back a single int
++    // instead of the full V=49152 fp16 logits buffer (98 KB blocking transfer).
++    const bool greedy_fast_path =
++        sampler_config.temperature <= 0.0f &&
++        sampler_config.repetition_penalty == 1.0f;
++
+     for (int i = 1; i < max_new_tokens; i++) {
+         const int start_pos = (int)prompt_ids.size() + (i - 1);
+-        std::vector<int32_t> single = { next_token };
+ 
+-        logits = forward(single, start_pos);
+-        if (logits.empty()) {
+-            NNOPT_ERROR("decode forward() returned empty logits");
+-            break;
++        if (greedy_fast_path) {
++            int32_t tok = forward_decode_greedy(next_token, start_pos);
++            if (tok < 0) {
++                NNOPT_ERROR("decode forward_decode_greedy failed; falling back to logits readback");
++                std::vector<int32_t> single = { next_token };
++                logits = forward(single, start_pos);
++                if (logits.empty()) break;
++                next_token = sampler.sample(logits, generated);
++            } else {
++                next_token = tok;
++            }
++        } else {
++            std::vector<int32_t> single = { next_token };
++            logits = forward(single, start_pos);
++            if (logits.empty()) {
++                NNOPT_ERROR("decode forward() returned empty logits");
++                break;
++            }
++            next_token = sampler.sample(logits, generated);
+         }
+-
+-        next_token = sampler.sample(logits, generated);
+         ids.push_back(next_token);
+         generated.push_back(next_token);
+         if (on_token) on_token(next_token);
+diff --git a/src/models/smollm2-135m-instruct/src/model.h b/src/models/smollm2-135m-instruct/src/model.h
+index 0358636..4516b8f 100644
+--- a/src/models/smollm2-135m-instruct/src/model.h
++++ b/src/models/smollm2-135m-instruct/src/model.h
+@@ -48,6 +48,13 @@ public:
+     // kernels in kernels/block_fused.cl. Agent fills in the body.
+     std::vector<float> forward_decode(int32_t token_id, int start_pos);
+ 
++    // Greedy decode fast path: skips the V=49152 fp16 logits readback
++    // (98 KB GPU→CPU per token, blocking) by running argmax on-GPU and
++    // reading back a single int. Only valid when temperature <= 0 AND
++    // repetition_penalty == 1.0. Returns -1 on failure; caller falls back
++    // to forward_decode + Sampler.
++    int32_t forward_decode_greedy(int32_t token_id, int start_pos);
++
+     // Streaming callback: invoked once per newly-generated token (NOT for
+     // prompt tokens). Use this to print/decode tokens live as they are
+     // produced. Runs synchronously on the generate() thread between tokens —
+@@ -72,6 +79,18 @@ private:
+     std::unique_ptr<LayerNorm> final_norm_;
+     std::unique_ptr<LmHead> lm_head_;
+ 
++    // GPU argmax fast path (greedy decode only). Lazy-initialized on first call.
++    cl_program argmax_prog_      = nullptr;
++    cl_kernel  argmax_partial_   = nullptr;
++    cl_kernel  argmax_final_     = nullptr;
++    cl_mem     argmax_scratch_v_ = nullptr;  // float[NUM_WG]
++    cl_mem     argmax_scratch_i_ = nullptr;  // int[NUM_WG]
++    cl_mem     argmax_out_idx_   = nullptr;  // int[1]
++    cl_mem     argmax_cur_token_ = nullptr;  // int[1]
++    bool       argmax_ready_     = false;
++    bool       argmax_tried_     = false;
++    bool ensure_argmax_program(cl_command_queue queue);
++
+     std::unique_ptr<LayerNorm> input_layernorm_[MODEL_CONFIG::NUM_HIDDEN_LAYERS];
+     std::unique_ptr<Attention> self_attn_[MODEL_CONFIG::NUM_HIDDEN_LAYERS];
+     std::unique_ptr<LayerNorm> post_attention_layernorm_[MODEL_CONFIG::NUM_HIDDEN_LAYERS];
+diff --git a/src/models/smollm2-135m-instruct/src/opencl_context.cpp b/src/models/smollm2-135m-instruct/src/opencl_context.cpp
+index 18e32ad..4739e61 100644
+--- a/src/models/smollm2-135m-instruct/src/opencl_context.cpp
++++ b/src/models/smollm2-135m-instruct/src/opencl_context.cpp
+@@ -5,6 +5,158 @@
+ #include <sstream>
+ #include <iostream>
+ #include <cstring>
++#include <cstdint>
++#include <sys/stat.h>
++#include <dlfcn.h>
++
++// ──────────────────────────────────────────────────────────────────────
++// Program binary cache — fixes the cold-start TTFT problem (~30 s
++// kernel-JIT compile on first-run, observed on Adreno 6xx). On first
++// build we save the binary via clGetProgramInfo(CL_PROGRAM_BINARIES);
++// on subsequent builds we load via clCreateProgramWithBinary, which
++// the Adreno compiler treats as already-compiled — TTFT drops to <1s.
++//
++// Cache directory:
++//   - On Android (cwd is the deploy dir under /data/local/tmp/...),
++//     we write to ./kernel_cache/ which is writable.
++//   - On host development we use the same relative path.
++// Cache key: 64-bit FNV-1a hash of (source + "|" + options + "|"
++//   + device_name + "|" + driver_version) so any change invalidates.
++// ──────────────────────────────────────────────────────────────────────
++namespace {
++
++const char* kCacheDir = "kernel_cache";
++
++uint64_t fnv1a64(const void* data, size_t len) {
++    const uint8_t* p = (const uint8_t*)data;
++    uint64_t h = 0xcbf29ce484222325ULL;
++    for (size_t i = 0; i < len; i++) {
++        h ^= p[i];
++        h *= 0x100000001b3ULL;
++    }
++    return h;
++}
++
++bool ensure_cache_dir() {
++    struct stat st;
++    if (stat(kCacheDir, &st) == 0) return true;
++    return mkdir(kCacheDir, 0755) == 0;
++}
++
++std::string cache_path(uint64_t key) {
++    char buf[64];
++    snprintf(buf, sizeof(buf), "%s/%016llx.bin", kCacheDir, (unsigned long long)key);
++    return std::string(buf);
++}
++
++bool read_file(const std::string& path, std::vector<unsigned char>* out) {
++    std::ifstream f(path, std::ios::binary);
++    if (!f.is_open()) return false;
++    f.seekg(0, std::ios::end);
++    std::streamoff sz = f.tellg();
++    if (sz <= 0) return false;
++    out->resize((size_t)sz);
++    f.seekg(0, std::ios::beg);
++    f.read(reinterpret_cast<char*>(out->data()), sz);
++    return f.good() || f.eof();
++}
++
++bool write_file(const std::string& path, const unsigned char* data, size_t len) {
++    std::ofstream f(path, std::ios::binary | std::ios::trunc);
++    if (!f.is_open()) return false;
++    f.write(reinterpret_cast<const char*>(data), (std::streamsize)len);
++    return f.good();
++}
++
++// Core: try cache → load binary; otherwise compile from source and cache.
++// Used by both OpenCLContext::build_program and the static helper.
++cl_program build_cached_core(cl_context ctx, cl_device_id dev,
++                             const std::string& source,
++                             const std::string& options) {
++    char dev_name[256] = {0};
++    char drv_ver [256] = {0};
++    clGetDeviceInfo(dev, CL_DEVICE_NAME,    sizeof(dev_name), dev_name, nullptr);
++    clGetDeviceInfo(dev, CL_DRIVER_VERSION, sizeof(drv_ver),  drv_ver,  nullptr);
++
++    std::string key_str;
++    key_str.reserve(source.size() + options.size() + 600);
++    key_str += source;
++    key_str += '|';
++    key_str += options;
++    key_str += '|';
++    key_str += dev_name;
++    key_str += '|';
++    key_str += drv_ver;
++    uint64_t cache_key = fnv1a64(key_str.data(), key_str.size());
++
++    bool cache_dir_ok = ensure_cache_dir();
++    std::string bin_path = cache_path(cache_key);
++    cl_int err = CL_SUCCESS;
++
++    if (cache_dir_ok) {
++        std::vector<unsigned char> bin;
++        if (read_file(bin_path, &bin) && !bin.empty()) {
++            const unsigned char* bin_ptr = bin.data();
++            size_t bin_len = bin.size();
++            cl_int bin_status = CL_SUCCESS;
++            cl_program prog = clCreateProgramWithBinary(
++                ctx, 1, &dev, &bin_len, &bin_ptr, &bin_status, &err);
++            if (err == CL_SUCCESS && bin_status == CL_SUCCESS && prog) {
++                err = clBuildProgram(prog, 1, &dev, options.c_str(),
++                                     nullptr, nullptr);
++                if (err == CL_SUCCESS) {
++                    return prog;
++                }
++                clReleaseProgram(prog);
++            } else if (prog) {
++                clReleaseProgram(prog);
++            }
++        }
++    }
++
++    const char* src_ptr = source.c_str();
++    size_t src_len = source.size();
++    cl_program program = clCreateProgramWithSource(ctx, 1, &src_ptr, &src_len, &err);
++    if (err != CL_SUCCESS) {
++        NNOPT_ERROR_FMT("clCreateProgramWithSource failed (err=%d)", (int)err);
++        return nullptr;
++    }
++    err = clBuildProgram(program, 1, &dev, options.c_str(), nullptr, nullptr);
++    if (err != CL_SUCCESS) {
++        NNOPT_ERROR_FMT("clBuildProgram FAILED (err=%d)", (int)err);
++        size_t log_size = 0;
++        clGetProgramBuildInfo(program, dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
++        if (log_size > 0) {
++            std::vector<char> log(log_size + 1, 0);
++            clGetProgramBuildInfo(program, dev, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
++            fprintf(stderr, "OpenCL Build Log: %s\n", log.data());
++            fflush(stderr);
++        }
++        clReleaseProgram(program);
++        return nullptr;
++    }
++
++    if (cache_dir_ok) {
++        cl_uint num_devs = 0;
++        clGetProgramInfo(program, CL_PROGRAM_NUM_DEVICES, sizeof(num_devs), &num_devs, nullptr);
++        if (num_devs == 1) {
++            size_t bin_size = 0;
++            clGetProgramInfo(program, CL_PROGRAM_BINARY_SIZES, sizeof(bin_size), &bin_size, nullptr);
++            if (bin_size > 0) {
++                std::vector<unsigned char> bin(bin_size);
++                unsigned char* bin_ptr = bin.data();
++                if (clGetProgramInfo(program, CL_PROGRAM_BINARIES,
++                                     sizeof(unsigned char*), &bin_ptr, nullptr) == CL_SUCCESS) {
++                    write_file(bin_path, bin.data(), bin_size);
++                }
++            }
++        }
++    }
++    return program;
++}
++
++}  // namespace
++
+ 
+ OpenCLContext::OpenCLContext() {}
+ 
+@@ -38,48 +190,82 @@ bool OpenCLContext::initialize(int platform_idx, int device_idx) {
+     context_ = clCreateContext(nullptr, 1, &device_, nullptr, nullptr, &err);
+     if (err != CL_SUCCESS) return false;
+ 
+-    queue_ = clCreateCommandQueue(context_, device_, CL_QUEUE_PROFILING_ENABLE, &err);
+-    return err == CL_SUCCESS;
+-}
++    // CL_QUEUE_PROFILING_ENABLE forces the GPU to record start/end timestamps
++    // on every dispatch — measurable overhead (~1–3% at our 240-disp/tok rate).
++    // Only set it when the per-kernel profiler is requested via NNOPT_PROFILE=1.
++    cl_command_queue_properties q_props = 0;
++    {
++        const char* e = std::getenv("NNOPT_PROFILE");
++        if (e && e[0] == '1') q_props |= CL_QUEUE_PROFILING_ENABLE;
++    }
++    queue_ = clCreateCommandQueue(context_, device_, q_props, &err);
++    if (err != CL_SUCCESS) return false;
+ 
+-cl_program OpenCLContext::build_program(const std::string& source, const std::string& options) {
+-    cl_int err;
+-    const char* src_ptr = source.c_str();
+-    size_t src_len = source.size();
++    // cl_qcom_perf_hint — boost-clock hint to the Adreno KGSL driver.
++    // Tells the dynamic-frequency governor to pin this context at the
++    // highest available power level instead of waiting for sustained load
++    // to detect a high-priority workload. Only Adreno GPUs respond.
++    //
++    // We load clSetPerfHintQCOM dynamically via clGetExtensionFunctionAddress
++    // because vendor headers aren't part of the standard cl.h we include
++    // (Qualcomm ships them with the Adreno SDK, not Khronos). Symbol name
++    // and constants come from public Adreno OpenCL Programming Guide.
++    //
++    // Set NNOPT_NO_PERF_HINT=1 to disable (e.g. for thermal-tuning A/B).
++    if (const char* off = std::getenv("NNOPT_NO_PERF_HINT"); !(off && off[0]=='1')) {
++        typedef cl_int (CL_API_CALL *clSetPerfHintQCOM_fn)(cl_context, cl_uint);
++        constexpr cl_uint CL_PERF_HINT_HIGH_QCOM = 0x40C3;
+ 
+-    cl_program program = clCreateProgramWithSource(context_, 1, &src_ptr, &src_len, &err);
+-    if (err != CL_SUCCESS) {
+-        NNOPT_ERROR_FMT("clCreateProgramWithSource failed (err=%d)", (int)err);
+-        return nullptr;
++        auto fn = (clSetPerfHintQCOM_fn)clGetExtensionFunctionAddressForPlatform(
++            platform_, "clSetPerfHintQCOM");
++
++        // Try dlsym with RTLD_DEFAULT — searches all currently-loaded libs
++        // for the symbol. Skips the ICD if the symbol is in libOpenCL.so
++        // already mapped into the process. Avoids a fresh dlopen.
++        if (!fn) {
++            fn = (clSetPerfHintQCOM_fn)dlsym(RTLD_DEFAULT, "clSetPerfHintQCOM");
++        }
++
++        if (fn) {
++            cl_int hint_err = fn(context_, CL_PERF_HINT_HIGH_QCOM);
++            std::cerr << "PerfHint: clSetPerfHintQCOM(HIGH) -> err=" << hint_err << std::endl;
++        } else {
++            std::cerr << "PerfHint: clSetPerfHintQCOM not exposed (ICD blocks vendor symbols)" << std::endl;
++        }
+     }
+ 
+-    // Forward host-side dtype to the kernel preamble. Without this, every
+-    // scaffold-emitted and agent-written kernel falls through to the fp32
+-    // path of `#ifdef USE_FP16` and reads garbage from cl_half buffers.
+-    std::string effective_options = options;
++    return true;
++}
++
++// Helper: append USE_FP16 + fast-relaxed-math to options if not present.
++static std::string make_effective_options(const std::string& options) {
++    std::string eff = options;
+ #ifdef NNOPT_USE_FP16
+-    if (effective_options.find("USE_FP16") == std::string::npos) {
+-        if (!effective_options.empty()) effective_options += " ";
+-        effective_options += "-D USE_FP16=1";
++    if (eff.find("USE_FP16") == std::string::npos) {
++        if (!eff.empty()) eff += " ";
++        eff += "-D USE_FP16=1";
+     }
+ #endif
++    if (eff.find("-cl-fast-relaxed-math") == std::string::npos) {
++        if (!eff.empty()) eff += " ";
++        eff += "-cl-fast-relaxed-math";
++    }
++    return eff;
++}
+ 
+-    err = clBuildProgram(program, 1, &device_, effective_options.c_str(), nullptr, nullptr);
+-    if (err != CL_SUCCESS) {
+-        NNOPT_ERROR_FMT("clBuildProgram FAILED (err=%d)", (int)err);
+-        size_t log_size = 0;
+-        clGetProgramBuildInfo(program, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
+-        if (log_size > 0) {
+-            std::vector<char> log(log_size + 1, 0);
+-            clGetProgramBuildInfo(program, device_, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
+-            fprintf(stderr, "OpenCL Build Log: %s\n", log.data());
+-            fflush(stderr);
+-        }
+-        clReleaseProgram(program);
++cl_program OpenCLContext::build_program(const std::string& source, const std::string& options) {
++    return build_cached_core(context_, device_, source, make_effective_options(options));
++}
++
++cl_program OpenCLContext::build_cached_program_from_queue(
++    cl_command_queue queue, const std::string& source, const std::string& options) {
++    cl_context  ctx = nullptr;
++    cl_device_id dev = nullptr;
++    if (clGetCommandQueueInfo(queue, CL_QUEUE_CONTEXT, sizeof(ctx), &ctx, nullptr) != CL_SUCCESS ||
++        clGetCommandQueueInfo(queue, CL_QUEUE_DEVICE,  sizeof(dev), &dev, nullptr) != CL_SUCCESS) {
+         return nullptr;
+     }
+-
+-    return program;
++    return build_cached_core(ctx, dev, source, make_effective_options(options));
+ }
+ 
+ cl_program OpenCLContext::build_program_from_file(const std::string& path, const std::string& options) {
+diff --git a/src/models/smollm2-135m-instruct/src/opencl_context.h b/src/models/smollm2-135m-instruct/src/opencl_context.h
+index ce0280a..3a72714 100644
+--- a/src/models/smollm2-135m-instruct/src/opencl_context.h
++++ b/src/models/smollm2-135m-instruct/src/opencl_context.h
+@@ -26,6 +26,15 @@ public:
+     size_t max_work_group_size() const;
+     size_t local_mem_size() const;
+ 
++    // Helper for code paths that only have a queue (e.g. utils::pytorch_linear's
++    // lazy gemv_m1 program build): same persistent-binary-cache behaviour as
++    // build_program(), but standalone — derives ctx + device from the queue
++    // and applies the same key (source + options + device_name + driver).
++    static cl_program build_cached_program_from_queue(
++        cl_command_queue queue,
++        const std::string& source,
++        const std::string& options);
++
+ private:
+     cl_platform_id platform_ = nullptr;
+     cl_device_id device_ = nullptr;

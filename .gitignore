@@ -1,0 +1,22 @@
+# secrets never live in the repo; the key file is ~/.config/task-factory/gemini-api-key
+*.key
+.env
+# large or third-party inputs, fetched by scripts
+src/
+models/
+data/
+runs/
+logs/
+.venv/
+__pycache__/
+
+# acceptance thresholds; never published
+private/
+
+# local run output and OS files
+jobs/
+.DS_Store
+# private planning notes (they name a client); keep them out of the public repo
+design/task-factory-plan.html
+# rollouts-only task: its Harbor package is not assembled yet
+tasks/lfm2-w4a16-gemv-decode/

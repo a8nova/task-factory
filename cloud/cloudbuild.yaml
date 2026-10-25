@@ -1,0 +1,9 @@
+# Build the gateway image on a large machine (the image pre-builds four adreno-llms commits).
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "us-central1-docker.pkg.dev/$PROJECT_ID/tf/tf-gateway:latest", "."]
+images: ["us-central1-docker.pkg.dev/$PROJECT_ID/tf/tf-gateway:latest"]
+options:
+  machineType: E2_HIGHCPU_32
+  diskSizeGb: 100
+timeout: 5400s

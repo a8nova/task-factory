@@ -1,0 +1,508 @@
+diff --git a/src/models/smollm2-135m-instruct/kernels/attention.cl b/src/models/smollm2-135m-instruct/kernels/attention.cl
+index 456f64d..7654bc4 100644
+--- a/src/models/smollm2-135m-instruct/kernels/attention.cl
++++ b/src/models/smollm2-135m-instruct/kernels/attention.cl
+@@ -125,7 +125,7 @@ __kernel void gqa_softmax(
+   float sum = 0.0f;
+   for (int c = 0; c < seq_k; ++c) {
+     float v = LOAD(scores, base + c);
+-    float e = exp(v - maxv);
++    float e = native_exp(v - maxv);
+     sum += e;
+     STORE(scores, base + c, e);
+   }
+diff --git a/src/models/smollm2-135m-instruct/kernels/block_fused.cl b/src/models/smollm2-135m-instruct/kernels/block_fused.cl
+index 11b21cd..7ee4f8f 100644
+--- a/src/models/smollm2-135m-instruct/kernels/block_fused.cl
++++ b/src/models/smollm2-135m-instruct/kernels/block_fused.cl
+@@ -36,12 +36,17 @@
+   #define STORE(p, i, v) ((p)[(i)] = (v))
+ #endif
+ 
++#ifdef USE_SUBGROUP_REDUCE
++  #pragma OPENCL EXTENSION cl_khr_subgroups : enable
++#endif
++
+ 
+ #define WG_SIZE 64
++#define MAX_SUBGROUPS 8
+ 
+ // Common activations (declared here so any agent-added kernel in this
+ // file can reuse them without re-declaring).
+-inline float silu_f(float x) { return x / (1.0f + exp(-x)); }
++inline float silu_f(float x) { return x / (1.0f + native_exp(-x)); }
+ inline float gelu_f(float x) {
+   // tanh approximation — matches transformers GeLU.NEW_GELU.
+   const float c0 = 0.7978845608f;          // sqrt(2/pi)
+@@ -361,7 +366,7 @@ void fused_gate_up_silu_m1(
+   }
+   if (tid == 0) {
+     float g = ls_gate[0];
+-    STORE(out, c, (g / (1.0f + exp(-g))) * ls_up[0]);
++    STORE(out, c, (g / (1.0f + native_exp(-g))) * ls_up[0]);
+   }
+ }
+ 
+@@ -516,7 +521,7 @@ void fused_gate_up_silu_m1_v4(
+   }
+   if (tid == 0) {
+     float g = ls_gate[0];
+-    vstore_half((g / (1.0f + exp(-g))) * ls_up[0], c, out);
++    vstore_half((g / (1.0f + native_exp(-g))) * ls_up[0], c, out);
+   }
+ }
+ 
+@@ -573,7 +578,7 @@ void fused_gate_up_silu_m1_v4_img(
+   }
+   if (tid == 0) {
+     float g = ls_gate[0];
+-    vstore_half((g / (1.0f + exp(-g))) * ls_up[0], c, out);
++    vstore_half((g / (1.0f + native_exp(-g))) * ls_up[0], c, out);
+   }
+ }
+ 
+@@ -786,6 +791,13 @@ void fused_down_residual_m1_no4_img(
+ 
+ #endif // USE_FP16
+ 
++// Tiny kernel for the cl_qcom_recordable_queues probe (PDF §9.1.3).
++// One atomic add per dispatch — per-launch CPU overhead dominates, exposing
++// any bookkeeping savings the recording API provides.
++__kernel void probe_noop(__global int* counter, const int incr) {
++  if (get_global_id(0) == 0) atomic_add(counter, incr);
++}
++
+ // SCAFFOLD-EMITTED (above, ready to call from host code):
+ //   - fused_oproj_residual_m1      (every transformer)
+ //   - fused_down_residual_m1       (every MLP with down-proj)
+@@ -852,7 +864,7 @@ void fused_decode_attn_m1(
+ 
+     // Step 1: QK^T — thread tid handles tokens tid, tid+64, tid+128, ...
+     for (int t = tid; t < seq_k; t += WG_SIZE) {
+-        const __global storage_t* k_t = k_cache + (size_t)t * KV_DIM + kvh * D;
++        const __global storage_t* k_t = k_cache + t * KV_DIM + kvh * D;
+         float score = 0.0f;
+         for (int d = 0; d < D; d++) score += LOAD(q_ptr, d) * LOAD(k_t, d);
+         ls_scores[t] = score * scale;
+@@ -862,26 +874,60 @@ void fused_decode_attn_m1(
+     // Step 2: stable softmax — parallel max over ls_scores
+     float mx = -1e30f;
+     for (int t = tid; t < seq_k; t += WG_SIZE) mx = fmax(mx, ls_scores[t]);
++#ifdef USE_SUBGROUP_REDUCE
++    {
++        float subg_m = sub_group_reduce_max(mx);
++        const uint sg_id  = get_sub_group_id();
++        const uint sg_lid = get_sub_group_local_id();
++        const uint nsg    = get_num_sub_groups();
++        if (sg_lid == 0) ls_partial[sg_id] = subg_m;
++        barrier(CLK_LOCAL_MEM_FENCE);
++        if (sg_id == 0) {
++            float v = (sg_lid < nsg) ? ls_partial[sg_lid] : -1e30f;
++            float tot = sub_group_reduce_max(v);
++            if (sg_lid == 0) ls_partial[0] = tot;
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++    }
++#else
+     ls_partial[tid] = mx;
+     barrier(CLK_LOCAL_MEM_FENCE);
+     for (int s = WG_SIZE >> 1; s > 0; s >>= 1) {
+         if (tid < s) ls_partial[tid] = fmax(ls_partial[tid], ls_partial[tid + s]);
+         barrier(CLK_LOCAL_MEM_FENCE);
+     }
++#endif
+     const float gmax = ls_partial[0];
+ 
+     // exp(score - max) + sum
+     float psum = 0.0f;
+     for (int t = tid; t < seq_k; t += WG_SIZE) {
+-        ls_scores[t] = exp(ls_scores[t] - gmax);
++        ls_scores[t] = native_exp(ls_scores[t] - gmax);
+         psum += ls_scores[t];
+     }
++#ifdef USE_SUBGROUP_REDUCE
++    {
++        float subg_s = sub_group_reduce_add(psum);
++        const uint sg_id  = get_sub_group_id();
++        const uint sg_lid = get_sub_group_local_id();
++        const uint nsg    = get_num_sub_groups();
++        if (sg_lid == 0) ls_partial[sg_id] = subg_s;
++        barrier(CLK_LOCAL_MEM_FENCE);
++        if (sg_id == 0) {
++            float v = (sg_lid < nsg) ? ls_partial[sg_lid] : 0.0f;
++            float tot = sub_group_reduce_add(v);
++            if (sg_lid == 0) ls_partial[0] = tot;
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++    }
++#else
+     ls_partial[tid] = psum;
+     barrier(CLK_LOCAL_MEM_FENCE);
+     for (int s = WG_SIZE >> 1; s > 0; s >>= 1) {
+         if (tid < s) ls_partial[tid] += ls_partial[tid + s];
+         barrier(CLK_LOCAL_MEM_FENCE);
+     }
++#endif
+     const float inv_sum = 1.0f / ls_partial[0];
+ 
+     for (int t = tid; t < seq_k; t += WG_SIZE) ls_scores[t] *= inv_sum;
+@@ -892,7 +938,7 @@ void fused_decode_attn_m1(
+     for (int d = tid; d < D; d += WG_SIZE) {
+         float acc = 0.0f;
+         for (int t = 0; t < seq_k; t++) {
+-            acc += ls_scores[t] * LOAD(v_cache + (size_t)t * KV_DIM + kvh * D, d);
++            acc += ls_scores[t] * LOAD(v_cache + t * KV_DIM + kvh * D, d);
+         }
+         STORE(out_ptr, d, acc);
+     }
+diff --git a/src/models/smollm2-135m-instruct/kernels/mlp_swiglu.cl b/src/models/smollm2-135m-instruct/kernels/mlp_swiglu.cl
+index 172823a..b2a8e08 100644
+--- a/src/models/smollm2-135m-instruct/kernels/mlp_swiglu.cl
++++ b/src/models/smollm2-135m-instruct/kernels/mlp_swiglu.cl
+@@ -13,7 +13,7 @@
+ #endif
+ 
+ inline float sigmoid_f(float x) {
+-    return 1.0f / (1.0f + exp(-x));
++    return 1.0f / (1.0f + native_exp(-x));
+ }
+ 
+ __kernel void silu_mul(__global const storage_t* gate,
+diff --git a/src/models/smollm2-135m-instruct/src/layers/attention.h b/src/models/smollm2-135m-instruct/src/layers/attention.h
+index e58067a..aa85bed 100644
+--- a/src/models/smollm2-135m-instruct/src/layers/attention.h
++++ b/src/models/smollm2-135m-instruct/src/layers/attention.h
+@@ -48,6 +48,20 @@ public:
+                                       cl_mem x, int start_pos,
+                                       cl_mem residual);
+ 
++    // Kernel-handle accessors for the recordable-queue path: Model::initialize
++    // collects these so it can issue arg updates between replays.
++    //   fused_rope_kvwrite_m1: arg 10 is start_pos.
++    //   fused_decode_attn_m1:  arg with seq_k.
++    cl_kernel rope_kvwrite_kernel() const { return fused_rope_kvwrite_m1_; }
++    cl_kernel decode_attn_kernel()  const { return fused_decode_attn_m1_;  }
++
++    // Pre-allocate RoPE cos/sin tables up to `max_seq` positions. Used by the
++    // recordable-queue setup to avoid mid-decode buffer re-allocation (which
++    // would invalidate the cl_mem references captured in the recording).
++    bool prewarm_rope_tables(cl_command_queue queue, int max_seq) {
++        return ensure_rope_tables(queue, max_seq);
++    }
++
+ private:
+     bool ensure_rope_tables(cl_command_queue queue, int seq_len);
+     bool ensure_kv_cache();   // Allocates k_cache_/v_cache_ once, on first forward.
+@@ -118,4 +132,16 @@ private:
+     cl_kernel fused_oproj_no4_img_    = nullptr;  // fused_oproj_residual_m1_no4_img
+     bool      qkv_img_ready_   = false;
+     bool      oproj_img_ready_ = false;
++
++    // ── int8 quantized path (NNOPT_QUANT=int8 + weights/model.int8.bin)
++    //   Per-row symmetric int8: image2d (CL_SIGNED_INT8 RGBA) + fp16 scale buffer.
++    //   Selected when weights_.get_dtype(prefix+"q_proj.weight")=="int8".
++    bool      quantized_ = false;
++    cl_program block_fused_int8_prog_ = nullptr;
++    cl_kernel gemv_k576_no4_img_int8_      = nullptr;
++    cl_kernel fused_oproj_no4_img_int8_    = nullptr;
++    cl_mem wq_int8_img_ = nullptr, wk_int8_img_ = nullptr,
++           wv_int8_img_ = nullptr, wo_int8_img_ = nullptr;
++    cl_mem wq_scale_ = nullptr, wk_scale_ = nullptr,
++           wv_scale_ = nullptr, wo_scale_ = nullptr;
+ };
+diff --git a/src/models/smollm2-135m-instruct/src/model.cpp b/src/models/smollm2-135m-instruct/src/model.cpp
+index a6c394d..5867d78 100644
+--- a/src/models/smollm2-135m-instruct/src/model.cpp
++++ b/src/models/smollm2-135m-instruct/src/model.cpp
+@@ -101,22 +101,101 @@ int32_t Model::forward_decode_greedy(int32_t token_id, int start_pos) {
+     clReleaseMemObject(ids_buf);
+     if (!hidden) return -1;
+ 
+-    // 2. Transformer layers (same as forward_decode).
+-    for (int i = 0; i < MODEL_CONFIG::NUM_HIDDEN_LAYERS; i++) {
+-        cl_mem normed = input_layernorm_[i]->forward_decode(queue, hidden);
+-        if (!normed) { clReleaseMemObject(hidden); return -1; }
+-        if (!self_attn_[i]->forward_decode_into_residual(queue, normed, start_pos, hidden)) {
+-            clReleaseMemObject(hidden); return -1;
++    // 2. Transformer layers (30) — with optional cl_qcom_recordable_queues path.
++    //    Recording mode threads layer chain through persistent decode_hidden_buf_
++    //    so the same kernel-arg cl_mem handles get captured at record time and
++    //    re-used on every replay. Embedding output is copied into the persistent
++    //    buffer once per call; subsequent layer dispatches mutate it in place.
++    cl_mem hidden_for_layers = hidden;
++    if (record_enabled_) {
++        err = clEnqueueCopyBuffer(queue, hidden, decode_hidden_buf_, 0, 0,
++                                  (size_t)MODEL_CONFIG::HIDDEN_SIZE * sizeof(nnopt_storage_t),
++                                  0, nullptr, nullptr);
++        clReleaseMemObject(hidden);
++        if (err != CL_SUCCESS) { NNOPT_ERROR_FMT("RecordQ: embed→persistent copy failed err=%d", err); return -1; }
++        hidden_for_layers = decode_hidden_buf_;
++    }
++
++    bool replayed = false;
++    if (record_enabled_ && recording_built_) {
++        // Replay path: 30 layers + KV cache writes run via the recording.
++        cur_start_pos_ = start_pos;
++        cur_seq_k_     = start_pos + 1;
++        std::vector<cl_array_arg_qcom> args;
++        args.reserve(rec_start_pos_args_.size() + rec_seq_k_args_.size());
++        for (auto& p : rec_start_pos_args_) {
++            args.push_back({p.kernel, p.arg_indx, sizeof(int), &cur_start_pos_});
+         }
+-        cl_mem normed2 = post_attention_layernorm_[i]->forward_decode(queue, hidden);
+-        if (!normed2) { clReleaseMemObject(hidden); return -1; }
+-        if (!mlp_[i]->forward_decode_into_residual(queue, normed2, hidden)) {
+-            clReleaseMemObject(hidden); return -1;
++        for (auto& p : rec_seq_k_args_) {
++            args.push_back({p.kernel, p.arg_indx, sizeof(int), &cur_seq_k_});
++        }
++        // DEBUG: try 0-args first (LFM2 probe baseline) to verify replay API works.
++        // If this succeeds we know the issue is in our args[] construction.
++        const bool USE_EMPTY_ARGS = std::getenv("NNOPT_RECORD_EMPTY_ARGS") &&
++                                    std::getenv("NNOPT_RECORD_EMPTY_ARGS")[0] == '1';
++        cl_int rerr;
++        if (USE_EMPTY_ARGS) {
++            rerr = cl_ctx_.enqueue_recording(queue, recording_, 0, nullptr);
++        } else {
++            rerr = cl_ctx_.enqueue_recording(queue, recording_, args.size(), args.data());
++        }
++        if (rerr != CL_SUCCESS) {
++            NNOPT_ERROR_FMT("RecordQ: enqueue_recording failed err=%d — disabling and re-dispatching live", rerr);
++            record_enabled_ = false;
++            // Fall through to live dispatch below.
++        } else {
++            replayed = true;
+         }
+     }
+ 
+-    cl_mem final_hidden = final_norm_->forward_decode(queue, hidden);
+-    clReleaseMemObject(hidden);
++    if (!replayed) {
++        for (int i = 0; i < MODEL_CONFIG::NUM_HIDDEN_LAYERS; i++) {
++            cl_mem normed = input_layernorm_[i]->forward_decode(queue, hidden_for_layers);
++            if (!normed) { if (hidden_for_layers != decode_hidden_buf_) clReleaseMemObject(hidden_for_layers); return -1; }
++            if (!self_attn_[i]->forward_decode_into_residual(queue, normed, start_pos, hidden_for_layers)) {
++                if (hidden_for_layers != decode_hidden_buf_) clReleaseMemObject(hidden_for_layers); return -1;
++            }
++            cl_mem normed2 = post_attention_layernorm_[i]->forward_decode(queue, hidden_for_layers);
++            if (!normed2) { if (hidden_for_layers != decode_hidden_buf_) clReleaseMemObject(hidden_for_layers); return -1; }
++            if (!mlp_[i]->forward_decode_into_residual(queue, normed2, hidden_for_layers)) {
++                if (hidden_for_layers != decode_hidden_buf_) clReleaseMemObject(hidden_for_layers); return -1;
++            }
++        }
++    }
++
++    // First call after live dispatch (only when recording enabled): capture the
++    // dispatch sequence into a recording on record_queue_ (no GPU work — host-
++    // side bookkeeping only). End the recording so subsequent calls can replay.
++    if (record_enabled_ && !recording_built_) {
++        recording_ = cl_ctx_.new_recording(record_queue_);
++        if (!recording_) {
++            std::cerr << "RecordQ: new_recording failed; disabling" << std::endl;
++            record_enabled_ = false;
++        } else {
++            bool rec_ok = true;
++            for (int i = 0; i < MODEL_CONFIG::NUM_HIDDEN_LAYERS; i++) {
++                cl_mem normed = input_layernorm_[i]->forward_decode(record_queue_, decode_hidden_buf_);
++                if (!normed) { rec_ok = false; break; }
++                if (!self_attn_[i]->forward_decode_into_residual(record_queue_, normed, start_pos, decode_hidden_buf_)) { rec_ok = false; break; }
++                cl_mem normed2 = post_attention_layernorm_[i]->forward_decode(record_queue_, decode_hidden_buf_);
++                if (!normed2) { rec_ok = false; break; }
++                if (!mlp_[i]->forward_decode_into_residual(record_queue_, normed2, decode_hidden_buf_)) { rec_ok = false; break; }
++            }
++            cl_int eerr = cl_ctx_.end_recording(recording_);
++            if (!rec_ok || eerr != CL_SUCCESS) {
++                std::cerr << "RecordQ: recording build failed (ok=" << rec_ok << " end_err=" << eerr << "); disabling" << std::endl;
++                cl_ctx_.release_recording(recording_);
++                recording_ = nullptr;
++                record_enabled_ = false;
++            } else {
++                recording_built_ = true;
++                std::cerr << "RecordQ: recording built (30 layers, start_pos@record=" << start_pos << ")" << std::endl;
++            }
++        }
++    }
++
++    cl_mem final_hidden = final_norm_->forward_decode(queue, hidden_for_layers);
++    if (hidden_for_layers != decode_hidden_buf_) clReleaseMemObject(hidden_for_layers);
+     if (!final_hidden) return -1;
+ 
+     cl_mem logits_buf = lm_head_->forward(queue, final_hidden, 1);
+@@ -214,6 +293,56 @@ bool Model::initialize() {
+     NNOPT_LAYER_INIT("lm_head");
+ 
+     clReleaseProgram(utils_program);
++
++    // Pre-warm RoPE cos/sin tables to MAX_POSITION_EMBEDDINGS up-front for ALL
++    // layers. Without this, ensure_rope_tables rebuilds the tables every decode
++    // step (seq_k grows by 1 each call → fp32 host loop + clCreateBuffer pair
++    // per layer per token). Pre-warming once at init saved +17% decode tok/s
++    // on Adreno 619 v2 (Step 12 measurement). Cheap: each layer reuses the
++    // same MAX_POSITION_EMBEDDINGS sized buffer.
++    for (int i = 0; i < MODEL_CONFIG::NUM_HIDDEN_LAYERS; ++i) {
++        if (!self_attn_[i]->prewarm_rope_tables(cl_ctx_.queue(),
++                                                 MODEL_CONFIG::MAX_POSITION_EMBEDDINGS)) {
++            NNOPT_ERROR_FMT("prewarm_rope_tables failed for layer %d", i);
++            return false;
++        }
++    }
++    NNOPT_CHECKPOINT("RoPE tables prewarmed for all layers");
++
++    // ── cl_qcom_recordable_queues setup (opt-in via NNOPT_RECORD=1).
++    if (const char* r = std::getenv("NNOPT_RECORD"); r && r[0] == '1') {
++        if (!cl_ctx_.has_recordable_queues()) {
++            std::cerr << "RecordQ: NNOPT_RECORD=1 set but extension not exposed; disabled" << std::endl;
++        } else {
++            record_queue_ = cl_ctx_.create_recordable_queue();
++            if (record_queue_) {
++                cl_int berr = CL_SUCCESS;
++                decode_hidden_buf_ = clCreateBuffer(
++                    cl_ctx_.context(), CL_MEM_READ_WRITE,
++                    (size_t)MODEL_CONFIG::HIDDEN_SIZE * sizeof(nnopt_storage_t),
++                    nullptr, &berr);
++                if (berr == CL_SUCCESS && decode_hidden_buf_) {
++                    // RoPE tables are already pre-warmed unconditionally above.
++                    // Collect per-layer kernel handles for the arg-update array on replay.
++                    //   fused_rope_kvwrite_m1: start_pos is arg 10 (see attention.cpp dispatch).
++                    //   fused_decode_attn_m1:  seq_k is arg 9.
++                    for (int i = 0; i < MODEL_CONFIG::NUM_HIDDEN_LAYERS; ++i) {
++                        rec_start_pos_args_.push_back({self_attn_[i]->rope_kvwrite_kernel(), 10});
++                        rec_seq_k_args_.push_back   ({self_attn_[i]->decode_attn_kernel(),  9});
++                    }
++                    record_enabled_ = true;
++                    std::cerr << "RecordQ: enabled (record_queue=" << record_queue_
++                              << ", H=" << MODEL_CONFIG::HIDDEN_SIZE
++                              << ", " << rec_start_pos_args_.size() << " per-step args x 2)" << std::endl;
++                } else {
++                    std::cerr << "RecordQ: alloc decode_hidden_buf_ failed err=" << berr << std::endl;
++                    clReleaseCommandQueue(record_queue_);
++                    record_queue_ = nullptr;
++                }
++            }
++        }
++    }
++
+     NNOPT_CHECKPOINT("Model::initialize() complete");
+     return true;
+ }
+@@ -291,6 +420,19 @@ std::vector<float> Model::forward(const std::vector<int32_t>& input_ids, int sta
+     // Dispatch single-token decode to the fast path (GEMV, not GEMM).
+     if (seq_len == 1 && start_pos > 0) return forward_decode(input_ids[0], start_pos);
+ 
++    // Int8 prefill fallback: CLBlast HGemm in pytorch_linear() does not speak int8,
++    // so we route prefill through the decode kernels token-by-token. Slower
++    // (O(seq_len) decode steps instead of one batched GEMM) but correctness-correct
++    // for the int8 weight path. Only the decode tok/s metric matters for tuning.
++    if (const char* q = std::getenv("NNOPT_QUANT"); q && std::string(q) == "int8") {
++        std::vector<float> last_logits;
++        for (int i = 0; i < seq_len; ++i) {
++            last_logits = forward_decode(input_ids[i], start_pos + i);
++            if (last_logits.empty()) return {};
++        }
++        return last_logits;
++    }
++
+     cl_command_queue queue = cl_ctx_.queue();
+ 
+     // Programs
+diff --git a/src/models/smollm2-135m-instruct/src/opencl_context.cpp b/src/models/smollm2-135m-instruct/src/opencl_context.cpp
+index 288f7cc..129851b 100644
+--- a/src/models/smollm2-135m-instruct/src/opencl_context.cpp
++++ b/src/models/smollm2-135m-instruct/src/opencl_context.cpp
+@@ -237,10 +237,65 @@ bool OpenCLContext::initialize(int platform_idx, int device_idx) {
+         }
+     }
+ 
++    // cl_qcom_recordable_queues entry-point load (PDF §9.1.3). dlsym from the
++    // already-loaded libOpenCL.so — same pattern as LFM2/Qwen probes.
++    fn_new_recording_     = (clNewRecordingQCOM_fn)    dlsym(RTLD_DEFAULT, "clNewRecordingQCOM");
++    fn_end_recording_     = (clEndRecordingQCOM_fn)    dlsym(RTLD_DEFAULT, "clEndRecordingQCOM");
++    fn_release_recording_ = (clReleaseRecordingQCOM_fn)dlsym(RTLD_DEFAULT, "clReleaseRecordingQCOM");
++    fn_enqueue_recording_ = (clEnqueueRecordingQCOM_fn)dlsym(RTLD_DEFAULT, "clEnqueueRecordingQCOM");
++    record_fns_loaded_ = (fn_new_recording_ && fn_end_recording_ &&
++                          fn_release_recording_ && fn_enqueue_recording_);
++    if (record_fns_loaded_) {
++        std::cerr << "RecordQ: cl_qcom_recordable_queues entry points loaded" << std::endl;
++    } else {
++        std::cerr << "RecordQ: cl_qcom_recordable_queues NOT available" << std::endl;
++    }
++
+     return true;
+ }
+ 
+-// Helper: append USE_FP16 + fast-relaxed-math to options if not present.
++cl_command_queue OpenCLContext::create_recordable_queue() {
++    if (!record_fns_loaded_) return nullptr;
++    // CL_QUEUE_RECORDABLE_QCOM = 0x40000000, used ALONE per LFM2 finding.
++    constexpr cl_command_queue_properties RECORD_BIT = (cl_command_queue_properties)1 << 30;
++    cl_int err = CL_SUCCESS;
++    cl_command_queue q = clCreateCommandQueue(context_, device_, RECORD_BIT, &err);
++    if (err != CL_SUCCESS || !q) {
++        std::cerr << "RecordQ: clCreateCommandQueue(RECORD_BIT) failed err=" << err << std::endl;
++        return nullptr;
++    }
++    return q;
++}
++
++cl_recording_qcom OpenCLContext::new_recording(cl_command_queue q) const {
++    if (!fn_new_recording_) return nullptr;
++    cl_int err = CL_SUCCESS;
++    cl_recording_qcom rec = fn_new_recording_(q, &err);
++    if (err != CL_SUCCESS) return nullptr;
++    return rec;
++}
++
++cl_int OpenCLContext::end_recording(cl_recording_qcom rec) const {
++    if (!fn_end_recording_) return CL_INVALID_OPERATION;
++    return fn_end_recording_(rec);
++}
++
++cl_int OpenCLContext::release_recording(cl_recording_qcom rec) const {
++    if (!fn_release_recording_) return CL_INVALID_OPERATION;
++    return fn_release_recording_(rec);
++}
++
++cl_int OpenCLContext::enqueue_recording(cl_command_queue live_q,
++                                        cl_recording_qcom rec,
++                                        size_t num_args,
++                                        const cl_array_arg_qcom* args) const {
++    if (!fn_enqueue_recording_) return CL_INVALID_OPERATION;
++    return fn_enqueue_recording_(live_q, rec, num_args, args,
++                                 0, nullptr, 0, nullptr, 0, nullptr,
++                                 0, nullptr, nullptr);
++}
++
++// Helper: append USE_FP16 + fast-relaxed-math (+ optional USE_SUBGROUP_REDUCE) to options if not present.
+ static std::string make_effective_options(const std::string& options) {
+     std::string eff = options;
+ #ifdef NNOPT_USE_FP16
+@@ -253,6 +308,29 @@ static std::string make_effective_options(const std::string& options) {
+         if (!eff.empty()) eff += " ";
+         eff += "-cl-fast-relaxed-math";
+     }
++    // Default to -cl-std=CL2.0 on Adreno A5x+ (all SmolLM2 deployment targets).
++    // Measured on Adreno 619 v2 (SM6375): CL 2.0 build path makes the GEMV
++    // family ~16-25% faster (better compiler vectorization / register allocation)
++    // even when no CL 2.0 builtin is used. Opt out via NNOPT_NO_CL2_STD=1.
++    if (const char* off = std::getenv("NNOPT_NO_CL2_STD"); !(off && off[0] == '1')) {
++        if (eff.find("-cl-std=") == std::string::npos) {
++            if (!eff.empty()) eff += " ";
++            eff += "-cl-std=CL2.0";
++        }
++    }
++    // Opt-in subgroup-reduce path (Phase 2 lever): flip with NNOPT_SUBGROUP_REDUCE=1.
++    // Kernel #ifdef USE_SUBGROUP_REDUCE swaps __local tree reduce for
++    // sub_group_reduce_{add,max}, per PDF §6.5/§8.9/§9.2.
++    // NOTE: Adreno 619 v2 measurement shows this REGRESSES rmsnorm + softmax
++    // (+90% per-kernel time) because at WG=64 there is exactly one full-wave
++    // subgroup and the cross-subgroup roll-up is wasted work vs a 6-step tree
++    // reduce. Keep behind the flag for re-test on devices with smaller waves.
++    if (const char* sgr = std::getenv("NNOPT_SUBGROUP_REDUCE"); sgr && sgr[0] == '1') {
++        if (eff.find("USE_SUBGROUP_REDUCE") == std::string::npos) {
++            if (!eff.empty()) eff += " ";
++            eff += "-D USE_SUBGROUP_REDUCE=1";
++        }
++    }
+     return eff;
+ }
+ 

@@ -1,0 +1,44 @@
+schema_version = "1.4"
+# Only the submission folder reaches the separate verifier container.
+artifacts = ["/workspace/submission"]
+
+[metadata]
+author_name = "Task Factory"
+difficulty = "{{DIFFICULTY}}"
+category = "inference-optimization"
+tags = {{TAGS}}
+source_repo = "https://github.com/a8nova/adreno-llms"
+source_commit = "{{SOURCE_COMMIT}}"
+base_commit = "{{BASE}}"
+port = "{{PORT}}"
+device = "Motorola Razr 2020 (Snapdragon 765G, Adreno 620)"
+
+[agent]
+timeout_sec = {{AGENT_TIMEOUT}}
+
+[environment]
+# The agent can reach the device gateway and nothing else, so it can't fetch the reference commit.
+network_mode = "allowlist"
+allowed_hosts = ["host.docker.internal"]
+build_timeout_sec = 900.0
+os = "linux"
+mcp_servers = []
+
+[environment.env]
+TF_GATEWAY = "${TF_GATEWAY:-http://host.docker.internal:8798}"
+TF_TASK = "{{TASK}}"
+TF_AGENT_TIMEOUT = "{{AGENT_TIMEOUT}}"
+
+[verifier]
+timeout_sec = 3600.0
+environment_mode = "separate"
+network_mode = "allowlist"
+allowed_hosts = ["host.docker.internal"]
+
+[verifier.env]
+TF_GATEWAY = "${TF_GATEWAY:-http://host.docker.internal:8798}"
+TF_TASK = "{{TASK}}"
+TF_VERIFIER_KEY = "${TF_VERIFIER_KEY}"
+TF_GATEWAY_HMAC = "${TF_GATEWAY_HMAC}"
+
+[solution.env]
